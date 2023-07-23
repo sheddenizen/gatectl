@@ -132,10 +132,24 @@ namespace aux {
   {
     public:
       Executor() {
-        add_command("help", std::function([this]{return this->help();}), "Help on available commands");
+        add_command("help", [this]{return this->help();}, "Help on available commands");
+      }
+      virtual ~Executor()
+      {
+        aux::Cmd * cmd = _head_cmd;
+        while(cmd) {
+          aux::Cmd * cmd_next = cmd->next();
+          delete cmd;
+          cmd = cmd_next;
+        }
+      }
+      template<typename Callable>
+      void add_command(std::string const & command, Callable const & c, std::string const & cmdhelp = {})
+      {
+        add_command(command, std::function(c), cmdhelp);
       }
       template<typename Signature>
-      void add_command(std::string const & command, std::function<Signature> fn, std::string const & cmdhelp = {})
+      void add_command(std::string const & command, std::function<Signature> const & fn, std::string const & cmdhelp = {})
       {
         using Fn = std::function<Signature>;
         using Tuple = typename aux::fnx<Fn>::arg_tuple;
