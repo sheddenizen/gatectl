@@ -1,9 +1,10 @@
 #include "sin_lookup.hpp"
 #include "lp_filter.hpp"
 #include "u_step_drv.hpp"
+#include "as5600.hpp"
+#include "cli.hpp"
 
 #include <array>
-#include <Wire.h>
 #include <sstream>
 #include <utility>
 
@@ -13,9 +14,10 @@ class SerialStream {
   public:
     std::ostringstream _buf;
 };
-
+// Dodgy hackery!
 template<typename T>
 SerialStream & operator << (SerialStream & ss, T const & x) {
+  using namespace cli;
   ss._buf << x;
   return ss;
 }
@@ -63,47 +65,6 @@ std::ostream & operator << (std::ostream & os, AnalogIn const & ai) {
   return os;
 }
 
-class AS5600PosnSensor {
-  public:
-    static constexpr uint16_t resbits = 12;
-    static constexpr uint16_t mask = (1 << resbits) - 1;
-    explicit AS5600PosnSensor(char const * name, TwoWire & i2c, uint16_t offset) 
-      : _name(name), _i2c(i2c), _offset(offset) {}
-    uint16_t raw() const {
-      _i2c.beginTransmission(0x36);
-      _i2c.write(uint8_t(0xe));
-      _i2c.endTransmission();
-      _i2c.requestFrom(0x36, 2);
-      uint8_t count = 0;
-
-      while ((count = _i2c.available()) < 2) {
-        Serial.printf("Wait %hhu\n", count);
-        delay(100);
-      }
-      uint16_t val = _i2c.read();
-      val = (val << 8) | _i2c.read();
-      const_cast<uint16_t &>(_last_raw) = val;
-      return val;      
-    }
-    uint16_t operator()() const { return (raw() + _offset) & mask; }
-    uint16_t degr(uint16_t raw_val) const 
-    { return ((raw_val + _offset) & mask) * 360 / (1 << resbits); }
-    uint16_t degr() const { return degr(raw()); }
-    uint16_t last_raw() const { return _last_raw; }
-    char const * name() const { return _name; }
-
-  private:
-    char const * const _name;
-    TwoWire & _i2c;
-    uint16_t _offset;
-    uint16_t _last_raw;
-};
-
-std::ostream & operator << (std::ostream & os, AS5600PosnSensor const & sens) {
-  uint16_t raw=sens.raw();
-  os << sens.name() << '=' << sens.degr(raw) << "deg(" << raw << ')';
-  return os;
-}
 
 /*
 static unsigned borked_sens_to_phase(uint16_t sens) {
@@ -242,48 +203,7 @@ class App {
     static void motor_task_entry(void *me) {
       (*(App*)me).motor_task();
     }
-    void test1_motor_task() {
-      unsigned pos = 0;
-      const uint16_t m = 8000;
-      int dir = 1;
-      for (;;) {
-        _mot_drive.set(pos,m);
-        usleep(10000);
-        unsigned a = _mot_angle.raw();
-        unsigned ca = pos % 12800 * 4096 / 12800;
-        ss << pos << ',' << a << ',' << (pos % 256) << ',' << (a * 50 % 4096 / 50) << ',' << ((4096 + a - ca) % 4096) << std::endl;
-        pos += dir;
-        if (pos == 25600)
-          dir = -1;
-        if (pos == 0)
-          dir = 1;
-      }
-    }
-    void test2_motor_task() {
-      unsigned pos = 0;
-      const uint16_t m = 8000;
-      int dir = 64;
-      _mot_drive.enable();
-      for (;;) {
-        _mot_drive.set(pos,m);
-        usleep(500000);
-        unsigned a = _mot_angle.raw();
-        unsigned ca = pos % 12800 * 4096 / 12800;
-        unsigned b=sens_to_phase(a);
-        unsigned c = 12800 * unsigned(a) / 4096;
-        ss << pos << ',' << a 
-          << ',' << b << ',' << ((12800+ b - pos) % 12800) << ',' << c << ',' << ((c-pos) % 12800) << std::endl;
-        ss << "----------------->" << (pos % 256) << ',' << (a * 50 % 4096 / 50) << ',' << ((4096 + a - ca) % 4096) 
-          << ',' << _mot_current_a.raw() << ',' << _mot_current_b.raw()
-          << std::endl;
-        pos += dir;
-        if (pos == 25600)
-          dir = -64;
-        if (pos == 0)
-          dir = 64;
-      }
-    }
-    void xx_motor_task() {
+    void test_motor_task() {
       const uint16_t m = 8000;
       unsigned pos = 0;
       unsigned sha = _mot_angle();
@@ -378,8 +298,18 @@ static void state_printer_task_entry(void* app) {
   }
 }
 
+std::string testcmd(int i, std::string s, float f)
+{
+  std::ostringstream os;
+  os << "This is a test: " << i << ' ' << s << ' ' << f;
+  return os.str();
+}
+
+cli::Executor cli_exec;
+
 void setup() {
   Serial.begin(115200);
+  Serial.setTimeout(1000);
   // Primary I2C uses default pins, but we'll be explicit 
   Wire.begin(21, 22);
   // Secondary, containing or 
@@ -388,12 +318,22 @@ void setup() {
   analogSetAttenuation(ADC_0db);
   app = new App;
 
+if(0){
   static TaskHandle_t mot_task;
   static TaskHandle_t state_printer_task;
   ss << "starts" << std::endl;
   xTaskCreatePinnedToCore(App::motor_task_entry, "motor_task", 10000, app, 0, &mot_task, 1);
   xTaskCreatePinnedToCore(state_printer_task_entry, "state_printer", 10000, app, 0, &state_printer_task, 0);
 }
+  cli_exec.add_command("test", std::function(testcmd), "test command <int> <string> <float>");
+  Serial.println("Start test");
+  testcmd(42,"hello",3.142);
+  auto t = std::make_tuple(43,"world",2.715);
+  std::apply(testcmd, t);
+  Serial.println("End test");
+
+}
+
 
 void loop() {
   //static unsigned n = 0;
@@ -401,6 +341,49 @@ void loop() {
   //int sp = int(s.first) / 64 * (s.second ? -1 : 1);
   //int sp = 1300;
   //app->set_drive(sp);
-  app->set_torque(0);
-  usleep(100000);
+  //app->set_torque(0);
+  //usleep(100000);
+
+  std::string line;
+  Serial.println("Here");
+  char esc = 0;
+  for (;;) {
+    char buf[2] = {};
+    int n = Serial.readBytes(buf, 1);
+    //ss << "Got n=" << n << ' ' << buf[0] << std::endl;
+    if (n == 1) {
+      if (esc > 0) {
+        if ((esc == '[' || (esc & 0x2f) == esc) && (buf[0] & 0x40) == 0x40 ) {
+          esc = 0;
+        } else {
+          esc = buf[0];
+        }
+        continue;
+      }
+      if (buf[0] == '\n' || buf[0] == '\r') {
+        Serial.println("");
+        break;
+      }
+      if (buf[0] >= ' ' && buf[0] <= '~') {
+        line+=buf[0];
+        Serial.write(buf[0]);
+      } else if (buf[0] == 127 && line.size()) {
+        Serial.print('\r');
+        for ([[maybe_unused]]auto x : line)
+          Serial.print(' ');
+        line.erase(line.end()-1);
+        Serial.print('\r');
+        Serial.print(line.c_str());
+      } else if (buf[0] == 27) {
+        esc = buf[0];
+      } else {
+        Serial.print('#');
+        Serial.println(int(buf[0]));
+        Serial.print(line.c_str());
+      }
+    } else {
+      esc = 0;
+    }
+  }
+  Serial.println(cli_exec(line).c_str());
 }
