@@ -13,7 +13,7 @@ class AS5600PosnSensor {
       : _name(name), _i2c(i2c), _offset(offset) {}
     uint16_t raw() const {
       _i2c.beginTransmission(0x36);
-      _i2c.write(uint8_t(0xe));
+      _i2c.write(uint8_t(0xc));
       _i2c.endTransmission();
       _i2c.requestFrom(0x36, 2);
       uint8_t count = 0;

@@ -70,9 +70,9 @@ class UStepDrv {
     static const auto _deadtime_us = 6;
     static const auto _freq = 15625;
     static const auto _dt_comp = (1 << _pwm_bits) * _deadtime_us * _freq / 1000000;
-    unsigned _angle;
-    bool _en;
-    uint16_t _mag;
+    unsigned _angle = 0;
+    bool _en = false;
+    uint16_t _mag = 0;
     unsigned _count = 0;
     friend std::ostream & operator << (std::ostream & os, UStepDrv const & drv);
 };

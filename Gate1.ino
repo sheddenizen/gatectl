@@ -164,7 +164,7 @@ class Servo {
       : _commutator(commutator)
       , _actual(actual)
       , _drive_limit(drive_limit)
-      , _gain_n(gain_n)
+      , _gain_n("torqpgain", gain_n)
       , _gain_d(gain_d)
       , _lpf(2, 60000)
     {}
@@ -186,7 +186,7 @@ class Servo {
     int _last_actual = 0;
     int _filt_actual = 0;
     int const _drive_limit;
-    int const _gain_n;
+    tunable::Item<int> _gain_n;
     int const _gain_d;
     LpFilter _lpf;
     int _drive = 0;
@@ -334,9 +334,9 @@ void setup() {
   app = new App;
 
   cli_exec.add_command("test", testcmd, "test command <int> <string> <float>");
-  cli_exec.add_command("torque", [](int mnm){app->set_torque(mnm); return true;}, "Set torque target, mNm");
-  cli_exec.add_command("drive", [](int mV){app->set_drive(mV); return true;}, "Set drive voltage, mV");
-  cli_exec.add_command("stop", [](){app->disengage(); return true;}, "Disengage drive");
+  cli_exec.add_command("torque", [](int mnm){app->set_torque(mnm); return "Ok";}, "Set torque target, mNm");
+  cli_exec.add_command("drive", [](int mV){app->set_drive(mV); return "Ok";}, "Set drive voltage, mV");
+  cli_exec.add_command("stop", [](){app->disengage(); return "Ok";}, "Disengage drive");
 
   ss << "Start Control Task" << std::endl;
   static TaskHandle_t mot_task;
@@ -345,13 +345,6 @@ void setup() {
 
 
 void loop() {
-  //static unsigned n = 0;
-  //auto s = sin_lookup(n);
-  //int sp = int(s.first) / 64 * (s.second ? -1 : 1);
-  //int sp = 1300;
-  //app->set_drive(sp);
-  //app->set_torque(0);
-  //usleep(100000);
 
   std::string line;
   char esc = 0;
