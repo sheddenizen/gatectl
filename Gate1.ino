@@ -8,6 +8,7 @@
 #include <array>
 #include <sstream>
 #include <utility>
+#include <functional>
 
 #include "cal_data.hpp"
 
@@ -153,18 +154,20 @@ class CommutatorCtl {
 };
 
 std::ostream & operator << (std::ostream & os, CommutatorCtl const & comm) {
-  os << "Commutator: " << "Rotor=" << comm._last_pos << " Duty=" << ((comm._drive16 * 100) >> 16) << "%(" << comm._drive16 << ") Phase=" << comm._last_phase_advance << " Supply=" << comm._last_supply << " Recovery: " << comm._recover_count;
+  os << "Comtr: " << "Rot=" << comm._last_pos << " Duty=" << ((comm._drive16 * 100) >> 16)
+     << "%(" << comm._drive16 << ") Ph=" << comm._last_phase_advance 
+     << " Vs=" << comm._last_supply << " Recovery: " << comm._recover_count;
   return os;
 }
 
 
 class Servo {
   public:
-    Servo(CommutatorCtl & commutator, AnalogIn & actual, unsigned drive_limit, int gain_n, int gain_d)
+    Servo(std::string name, CommutatorCtl & commutator, AnalogIn & actual, unsigned drive_limit, int gain_n, int gain_d)
       : _commutator(commutator)
       , _actual(actual)
-      , _drive_limit(drive_limit)
-      , _gain_n("torqpgain", gain_n)
+      , _drive_limit(name+ "lim", drive_limit)
+      , _gain_n(name + "pgain", gain_n)
       , _gain_d(gain_d)
       , _lpf(2, 60000)
     {}
@@ -185,7 +188,7 @@ class Servo {
     int _target = 0;
     int _last_actual = 0;
     int _filt_actual = 0;
-    int const _drive_limit;
+    tunable::Item<int> _drive_limit;
     tunable::Item<int> _gain_n;
     int const _gain_d;
     LpFilter _lpf;
@@ -210,11 +213,13 @@ class App {
       , _batt_mv("Battery", "mV", 39, 0, 0, 2675, 12140)
       , _mot_drive({25,26,27,13}, 23)
       , _commutator(_mot_drive, _mot_angle, _batt_mv, 10000)
-      , _torque_servo(_commutator, _torque, 2000, 2000, 1000)
+      , _torque_servo("torq", _commutator, _torque, 2000, 2000, 1000)
       {}
-    void loop() {}
-    static void motor_task_entry(void *me) {
-      (*(App*)me).motor_task();
+
+    void start_loop()
+    {
+      ss << "Start Control Task" << std::endl;
+      xTaskCreatePinnedToCore([](void *app){ (*(App*)app).motor_task(); }, "motor_task", 10000, this, 0, &_mot_task, 1);
     }
     void test_motor_task() {
       const uint16_t m = 8000;
@@ -262,13 +267,6 @@ class App {
         ss << std::endl;
       }
     }
-    void motor_task() {
-      for (;;) {
-        if (_torque_mode)
-          _torque_servo.loop();
-        _commutator.loop();
-      }
-    }
     void set_torque(int mnm) {
       _torque_mode = true;
       _torque_servo.set_target(mnm);
@@ -282,6 +280,17 @@ class App {
       _commutator.disengage();
     }
   private:
+    static void motor_task_entry(void *me) {
+      (*(App*)me).motor_task();
+    }
+    void motor_task() {
+      for (;;) {
+        if (_torque_mode)
+          _torque_servo.loop();
+        _commutator.loop();
+      }
+    }
+
     AS5600PosnSensor _drive_angle;
     AS5600PosnSensor _mot_angle;
     AnalogIn _mot_current_a;
@@ -292,6 +301,7 @@ class App {
     CommutatorCtl _commutator;
     Servo _torque_servo;
     bool _torque_mode = false;
+    TaskHandle_t _mot_task = 0;
     friend std::ostream & operator << (std::ostream & os, App const & app);
 };
 
@@ -309,7 +319,7 @@ std::ostream & operator << (std::ostream & os, App const & app) {
 static App * app;
 
 static void print_state() {
-    ss << (*(App*)app) << std::endl;
+    ss << (*app) << std::endl;
 }
 
 std::string testcmd(int i, std::string s, float f)
@@ -338,14 +348,14 @@ void setup() {
   cli_exec.add_command("drive", [](int mV){app->set_drive(mV); return "Ok";}, "Set drive voltage, mV");
   cli_exec.add_command("stop", [](){app->disengage(); return "Ok";}, "Disengage drive");
 
-  ss << "Start Control Task" << std::endl;
-  static TaskHandle_t mot_task;
-  xTaskCreatePinnedToCore(App::motor_task_entry, "motor_task", 10000, app, 0, &mot_task, 1);
+  app->start_loop();
+
 }
 
-
-void loop() {
-
+// Wait indefinitely for user to enter a line of text on the serial interface, allowing for backspace, but ignoring ANSI
+// terminal sequences for now. If no text is in the line buffer, idlefn() will be called on each serial timeout
+std::string serial_get_line(std::function<void()> idlefn)
+{
   std::string line;
   char esc = 0;
   for (;;) {
@@ -385,10 +395,16 @@ void loop() {
       }
     } else {
       esc = 0;
-      if (line.empty()) {
-        print_state();
+      if (line.empty() && idlefn) {
+        idlefn();
       }
     }
   }
+  return line;
+}
+
+void loop()
+{
+  std::string line = serial_get_line(print_state);
   Serial.println(cli_exec(line).c_str());
 }
