@@ -2,7 +2,7 @@
 
 data = [ None ] * 4096
 
-with open('caldata-edit.csv') as f:
+with open('cal2-data.csv') as f:
   lines = f.readlines()
 
 for line in lines:
@@ -60,9 +60,9 @@ lu=[]
 for x,y in enumerate(smoo):
   a=avgs[x]
   n=(x*12800)//4096
-  print(f'{x},{a},{y},{round(y-a) % 12800 if a is not None else 0},{n},{ (y-n) % 12800 }')
+  print(f'{x} {a} {y} {round(y-a) % 12800 if a is not None else 0} {n} { (y-n) % 12800 }')
   lu.append((y-n) % 12800)
 
-EPL=32
-for c in range(0,4096, EPL):
-  print(', '.join([ str(e) for e in lu[c:c+EPL]])+',')
+#EPL=32
+#for c in range(0,4096, EPL):
+#  print(', '.join([ str(e) for e in lu[c:c+EPL]])+',')

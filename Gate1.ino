@@ -1,12 +1,14 @@
 #include "sin_lookup.hpp"
 #include "lp_filter.hpp"
-#include "u_step_drv.hpp"
+#include "commutator_ctl.hpp"
 #include "as5600.hpp"
+#include "analog_in.hpp"
 #include "cli.hpp"
 #include "tunable.hpp"
 
 #include <array>
 #include <sstream>
+#include <iomanip>
 #include <utility>
 #include <functional>
 
@@ -33,158 +35,29 @@ SerialStream & operator << (SerialStream & ss, std::ostream & (fn)( std::ostream
 
 SerialStream ss;
 
-class AnalogIn {
-  public:
-    AnalogIn(char const * name, char const * units, uint8_t pin, int16_t cal1raw, int cal1val, int16_t cal2raw, int cal2val)
-      : _name(name), _units(units), _pin(pin)
-      ,  _num(cal2val - cal1val)
-      ,  _div(cal2raw - cal1raw)
-      ,  _offs(-cal1raw * _num / _div -cal1val)
-    {
-      analogSetPinAttenuation(pin, ADC_0db);
-    }
-
-    int raw() const { return analogRead(_pin); }
-    int scale(int raw) const { return raw * _num / _div + _offs; } 
-    int operator() () const { return scale(raw()); }
-
-    char const * name() const { return _name; };
-    char const * units() const { return _units; };
-    
-  private:
-    char const * _name;
-    char const * _units;
-    uint8_t _pin;
-    int _num;
-    int _div;
-    int _offs;
-    friend std::ostream & operator << (std::ostream & os, AnalogIn const & ai);
-};
-
-std::ostream & operator << (std::ostream & os, AnalogIn const & ai) {
-  int raw=ai.raw();
-  os << ai.name() << '=' << ai.scale(raw) << ai.units() << '(' << raw << ')';
-  return os;
-}
-
-
-/*
-static unsigned borked_sens_to_phase(uint16_t sens) {
-  auto sin16p = sin_lookup(sens/4);
-  // Offset = 29.96 -> 49M / 2^19
-  unsigned const stat_offs = 49095153;
-//  unsigned const stat_offs = 60000000;
-  // Magical fiddle factor = 19 sensor counts. 19 * 12800 /4096 = 475 / 8
-  unsigned result = unsigned(sens) * 12800 / 4096 + 12800;
-  if (sin16p.second)
-    result -= ((stat_offs - 475 * unsigned(sin16p.first)) >> 19);
-  else
-    result -= ((stat_offs + 475 * unsigned(sin16p.first)) >> 19);
-  return result % 12800;
-}
-*/
-static unsigned sens_to_phase(uint16_t sens) {
-  unsigned result = 12800 * sens / 4096;
-  result = result + unsigned(cal_data[sens]);
-  return result;
-}
-
-class CommutatorCtl {
-  public:
-    CommutatorCtl(UStepDrv & mot_drive, AS5600PosnSensor & rotor_pos, AnalogIn & supply_mv, unsigned supply_cutoff_mv)
-      : _mot_drive(mot_drive), _rotor_pos(rotor_pos), _supply_mv(supply_mv), _supply_cutoff_mv(supply_cutoff_mv), _base_phase_advance("phaseadv", 64)
-    {}
-    void set_drive_mv(int mvolts) {
-      _last_supply = _supply_mv();
-/*      if (_last_supply < _supply_cutoff_mv) {
-        if (_supply_filt > 100000) {
-          _mot_drive.disable();
-          _recover_count = 100;
-          _supply_filt = 0;
-          return;
-        } else {
-          _supply_filt += _supply_cutoff_mv - _last_supply;
-        }
-      }
-      if (_recover_count > 0) {
-        _recover_count--;
-        return;
-      }
-*/
-      _drive_phase = mvolts < 0 ? -_base_phase_advance : _base_phase_advance;
-      unsigned abs_mvolts = mvolts < 0 ? -mvolts : mvolts;
-      abs_mvolts = abs_mvolts < _last_supply ? abs_mvolts : _last_supply;
-      _drive16 = _last_supply > abs_mvolts ? (abs_mvolts << 16) / _last_supply : (1 << 16) - 1;
-      if (!_mot_drive.enabled()) {
-        _mot_drive.enable();
-      }
-    }
-    void disengage() {
-      set_drive_mv(0);
-      _mot_drive.disable();
-    }
-    void loop() {
-      unsigned pos = _rotor_pos();
-      unsigned phase_pos = sens_to_phase(pos);
-
-      int delta = (25600 + phase_pos - _last_phase_pos) % 12800;
-      delta -= delta > 6400 ? 12800 : 0;
-      _last_phase_advance = _drive_phase + delta/2;
-      if (_mot_drive.enabled()) {
-        _mot_drive.set(phase_pos + _last_phase_advance, _drive16);
-      }
-      _last_pos = pos;
-      _last_phase_pos = phase_pos;
-    }
-  private:
-    UStepDrv & _mot_drive;
-    AS5600PosnSensor & _rotor_pos;
-    AnalogIn & _supply_mv;
-    unsigned const _supply_cutoff_mv;
-    int _last_supply = 0;
-    unsigned _drive16 = 0;
-    unsigned _last_pos = 0;
-    unsigned _last_phase_pos = 0;
-    int _last_phase_advance = 0;
-    tunable::Item<int> _base_phase_advance;
-    int _drive_phase;
-    unsigned _recover_count = 0;
-    unsigned _supply_filt = 0;
-    friend std::ostream & operator << (std::ostream & os, CommutatorCtl const & comm);
-};
-
-std::ostream & operator << (std::ostream & os, CommutatorCtl const & comm) {
-  os << "Comtr: " << "Rot=" << comm._last_pos << " Duty=" << ((comm._drive16 * 100) >> 16)
-     << "%(" << comm._drive16 << ") Ph=" << comm._last_phase_advance 
-     << " Vs=" << comm._last_supply << " Recovery: " << comm._recover_count;
-  return os;
-}
-
 
 class Servo {
   public:
-    Servo(std::string name, CommutatorCtl & commutator, AnalogIn & actual, unsigned drive_limit, int gain_n, int gain_d)
-      : _commutator(commutator)
-      , _actual(actual)
+    Servo(std::string name, unsigned drive_limit, int gain_n, int gain_d, int lp_ff_percent)
+      : _name(name)
       , _drive_limit(name+ "lim", drive_limit)
       , _gain_n(name + "pgain", gain_n)
       , _gain_d(gain_d)
-      , _lpf(2, 60000)
+      , _lpf(lp_ff_percent, 60000)
     {}
     void set_target(int target) {
       _target = target;
     }
-    void loop() {
-      _last_actual = _actual();
+    int loop(int actual) {
+      _last_actual = actual;
       _filt_actual = _lpf(_last_actual);
       _drive = (_target - _filt_actual) * _gain_n / _gain_d;
       _drive = _drive > _drive_limit ? _drive_limit : _drive;
       _drive = _drive < -_drive_limit ? -_drive_limit : _drive;
-      _commutator.set_drive_mv(_drive);
+      return _drive;
     }
   private:
-    CommutatorCtl & _commutator;
-    AnalogIn & _actual;
+    std::string _name;
     int _target = 0;
     int _last_actual = 0;
     int _filt_actual = 0;
@@ -197,76 +70,64 @@ class Servo {
 };
 
 std::ostream & operator << (std::ostream & os, Servo const & srv) {
-  os << "Servo: Target: " << srv._target << " Actual " << srv._actual.name() << ": " << srv._last_actual << srv._actual.units() << " Filt:" << srv._filt_actual << " Drive: " << srv._drive;
+  os << srv._name << " servo: Target: " << srv._target << " Actual" << ": " << srv._last_actual << " Filt:" << srv._filt_actual << " Drive: " << srv._drive;
   return os;
 }
 
 
 class App {
   public:
+    struct stats {
+      unsigned start_pos = 0;
+      unsigned last_pos = 0;
+      int mot_i_a = 0;
+      int mot_i_b = 0;
+      int torque = 0;
+      int count = 0;
+      int drive = 0;
+      uint32_t tstart = 0;
+      uint32_t tlast = 0;
+      int speed = 0;
+      int duration_us = 0;
+      unsigned rate = 0;
+    };
     App()
       : _drive_angle("Drive", Wire, 0)
-      , _mot_angle("Mot", Wire1, 2048)
+      , _mot_angle("Mot", Wire1, 0)
       , _mot_current_a("Mot Phase A", "mA", 34, 64, 0, 1305, 3320)
       , _mot_current_b("Mot Phase B", "mA", 35, 62, 0, 1200, 3001)
       , _torque("Torque", "mNm", 36, 1725, 0, 1560, -805)
       , _batt_mv("Battery", "mV", 39, 0, 0, 2675, 12140)
       , _mot_drive({25,26,27,13}, 23)
       , _commutator(_mot_drive, _mot_angle, _batt_mv, 10000)
-      , _torque_servo("torq", _commutator, _torque, 2000, 2000, 1000)
-      {}
+      , _torque_servo("torq", 2000, 2000, 1000, 2)
+      {
+        start_task();
+      }
 
-    void start_loop()
+    bool run()
     {
-      ss << "Start Control Task" << std::endl;
-      xTaskCreatePinnedToCore([](void *app){ (*(App*)app).motor_task(); }, "motor_task", 10000, this, 0, &_mot_task, 1);
+      if (_run)
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+      vTaskResume(_mot_task);
+      vTaskDelay(50 / portTICK_PERIOD_MS);
+      return _run;
     }
-    void test_motor_task() {
-      const uint16_t m = 8000;
-      unsigned pos = 0;
-      unsigned sha = _mot_angle();
-      unsigned sha_p = sha;
-      _mot_drive.enable();
-      _mot_drive.set(pos,m);
-      usleep(100000);
-      while (sha < 4000 || sha_p > 100) {
-        sha_p = sha;
-        sha = _mot_angle();
-        _mot_drive.set(pos--,m);
-        usleep(1000);
-      }
-      _mot_drive.set(--pos,m);
-      usleep(10000);
-      sha = _mot_angle();
-      sha_p = sha;
-      pos = pos & 255;
-      unsigned pos_p = pos;
-      ss << std::endl;
-      for (;;) {
-        for (; pos < 12800 * 5 ; ++pos) {
-          sha_p = sha;
-          sha = _mot_angle();
-          if (sha != sha_p && sha > sha_p) {
-            ss << pos << ',' << sha << ',' << pos_p << ',' << sha_p << ',' << ((pos+pos_p)/2) << std::endl;
-            pos_p = pos;
-          }
-          _mot_drive.set(pos,m);
-          usleep(10000);
-        }
-        ss << std::endl;
-        for (; pos <= 12800 * 5 ; --pos) {
-          sha_p = sha;
-          sha = _mot_angle();
-          if (sha != sha_p && sha < sha_p) {
-            ss << pos << ',' << sha << ',' << pos_p << ',' << sha_p << ',' << ((pos+pos_p)/2) << std::endl;
-            pos_p = pos;
-          }
-          _mot_drive.set(pos,m);
-          usleep(10000);
-        }
-        ss << std::endl;
-      }
+    bool stop()
+    {
+      _run = false;
+      vTaskDelay(50 / portTICK_PERIOD_MS);
+      return !_run;
     }
+    bool run_test() { 
+      if (!_run) {
+        test_motor_task();
+        return true;
+      }
+      return false;
+    }
+    bool running() const { return _run; }
+
     void set_torque(int mnm) {
       _torque_mode = true;
       _torque_servo.set_target(mnm);
@@ -279,16 +140,106 @@ class App {
       _torque_mode = false;
       _commutator.disengage();
     }
-  private:
-    static void motor_task_entry(void *me) {
-      (*(App*)me).motor_task();
+    void reset_stats()
+    {
+      _last_stats = calc_stats();
+      _stats = {};
+      _stats.tstart = esp_timer_get_time();
+      _stats.tlast = _stats.tstart; 
+      _stats.start_pos = _commutator.last_pos();
     }
+    stats const & get_last_stats() const { return _last_stats; }
+  private:
     void motor_task() {
       for (;;) {
-        if (_torque_mode)
-          _torque_servo.loop();
-        _commutator.loop();
+        while (_run) {
+          auto torque = _torque();
+          _stats.torque += torque;
+          if (_torque_mode) {
+            auto drive = _torque_servo.loop(torque);
+            _commutator.set_drive_mv(drive);
+          }
+          _stats.drive += _commutator.get_drive_mv();
+          _commutator.loop();
+          _count++;
+          _stats.count++;
+          _stats.last_pos = _commutator.last_pos();
+          _stats.mot_i_a += _mot_current_a();
+          _stats.mot_i_b += _mot_current_b();
+          _stats.tlast = esp_timer_get_time();
+        }
+        disengage();
+        vTaskSuspend(_mot_task);
+        _run = true;
       }
+    }
+    void start_task()
+    {
+      ss << "Start Control Task" << std::endl;
+      xTaskCreatePinnedToCore([](void *app){ (*(App*)app).motor_task(); }, "motor_task", 10000, this, 0, &_mot_task, 1);
+    }
+    stats calc_stats() {
+      stats s = _stats;
+      s.duration_us = s.tlast - s.tstart;
+      if (s.count == 0 || s.duration_us == 0)
+        return s;
+      s.mot_i_a /= s.count;
+      s.mot_i_b /= s.count;
+      s.drive /= s.count;
+      s.torque /= s.count;
+      s.speed = (s.last_pos - s.start_pos) & 4095;
+      s.speed = s.speed >= 2048 ? -(4096 - s.speed) : s.speed;
+      s.speed = s.speed * 1000000 / s.duration_us;
+      s.rate = s.count * 1000000 / s.duration_us;
+      return s;
+    }
+    void test_motor_task() {
+      const uint16_t m = 8000;
+      const auto delay = 10;
+      unsigned pos = 0;
+      unsigned sha = _mot_angle();
+      unsigned sha_p = sha;
+      usleep(100000);
+      ss << "Preparing initial test conditions" << std::endl;
+      _mot_drive.enable();
+      _mot_drive.set(pos,m);
+      while (sha < 4000 || sha_p > 100) {
+        sha_p = sha;
+        sha = _mot_angle();
+        _mot_drive.set(pos--,m);
+        usleep(1000);
+      }
+      ss << "------------------------- Test Start -------------------------" << std::endl;
+      _mot_drive.set(--pos,m);
+      usleep(delay * 1000);
+      sha = _mot_angle();
+      sha_p = sha;
+      pos = pos & 255;
+      unsigned pos_p = pos;
+      ss << std::endl;
+      for (; pos < 12800 * 5; ++pos) {
+        sha_p = sha;
+        sha = _mot_angle();
+        if (sha != sha_p && sha > sha_p) {
+          ss << pos << ',' << sha << ',' << pos_p << ',' << sha_p << ',' << ((pos+pos_p)/2) << std::endl;
+          pos_p = pos;
+        }
+        _mot_drive.set(pos,m);
+        usleep(delay * 1000);
+      }
+      ss << std::endl;
+      for (; pos <= 12800 * 5; --pos) {
+        sha_p = sha;
+        sha = _mot_angle();
+        if (sha != sha_p && sha < sha_p) {
+          ss << pos << ',' << sha << ',' << pos_p << ',' << sha_p << ',' << ((pos+pos_p)/2) << std::endl;
+          pos_p = pos;
+        }
+        _mot_drive.set(pos,m);
+        usleep(delay * 1000);
+      }
+      ss << std::endl;
+      ss << "------------------------- Test End -------------------------" << std::endl;
     }
 
     AS5600PosnSensor _drive_angle;
@@ -302,31 +253,37 @@ class App {
     Servo _torque_servo;
     bool _torque_mode = false;
     TaskHandle_t _mot_task = 0;
+    bool _run = false;
+    unsigned _count = 0;
+    stats _stats;
+    stats _last_stats;
     friend std::ostream & operator << (std::ostream & os, App const & app);
 };
 
+std::ostream & operator << (std::ostream & os, App::stats const & s) {
+  using std::setw;
+  os << "f=" << setw(4) << s.rate << "Hz "
+     << "sp=" << setw(4) << s.speed << "Hz "
+     << "Ia=" << setw(4) << s.mot_i_a << "mA "
+     << "Ib=" << setw(4) << s.mot_i_b << "mA "
+     << "Vm=" << setw(4) << s.drive << "mV "
+     << "T=" << setw(4) << s.torque << "mNm";
+     return os;
+}
 std::ostream & operator << (std::ostream & os, App const & app) {
-  os << app._drive_angle << ' ' 
-     << app._mot_current_a << ' ' 
-     << app._mot_current_b << ' '
-     << app._mot_drive << ' '
-     << app._commutator;
-  if (app._torque_mode)
-     os << ' ' << app._torque_servo;
+  os << (app._run ? "Run " : "Stop ")
+     << app.get_last_stats() << ' '
+     << app._drive_angle << ' ' 
+     << app._commutator
+     << ' ' << app._mot_current_a << ' ' << app._mot_current_b;
   return os;
 }
 
 static App * app;
 
 static void print_state() {
-    ss << (*app) << std::endl;
-}
-
-std::string testcmd(int i, std::string s, float f)
-{
-  std::ostringstream os;
-  os << "This is a test: " << i << ' ' << s << ' ' << f;
-  return os.str();
+  app->reset_stats();
+  ss << (*app) << std::endl;
 }
 
 cli::Executor cli_exec;
@@ -336,20 +293,22 @@ void setup() {
   Serial.setTimeout(2000);
   // Primary I2C uses default pins, but we'll be explicit 
   Wire.begin(21, 22);
-  // Secondary, containing or 
-  Wire1.begin(5,18);
+  // Secondary, containing our motor positon sensor
+  Wire1.begin(5,18, 400000);
   analogReadResolution(12);
   analogSetAttenuation(ADC_0db);
   tunable::set_cli_executor(cli_exec);
   app = new App;
 
-  cli_exec.add_command("test", testcmd, "test command <int> <string> <float>");
   cli_exec.add_command("torque", [](int mnm){app->set_torque(mnm); return "Ok";}, "Set torque target, mNm");
   cli_exec.add_command("drive", [](int mV){app->set_drive(mV); return "Ok";}, "Set drive voltage, mV");
-  cli_exec.add_command("stop", [](){app->disengage(); return "Ok";}, "Disengage drive");
-
-  app->start_loop();
-
+  cli_exec.add_command("disengage", [](){app->disengage(); return "Ok"; }, "Disengage drive");
+  cli_exec.add_command("stop", [](){return app->stop(); }, "Disengage drive, stop control task");
+  cli_exec.add_command("run", [](){return app->run(); }, "Start motor control task");
+  cli_exec.add_command("running", [](){return app->running(); }, "Is motor control task running?");
+  cli_exec.add_command("run-test", [](){return app->run_test(); }, "Run position calibration (if stopped)");
+  cli_exec.add_command("period", [](int ms){Serial.setTimeout(ms); return "Ok"; }, "Set status print interval, ms");
+  
 }
 
 // Wait indefinitely for user to enter a line of text on the serial interface, allowing for backspace, but ignoring ANSI
