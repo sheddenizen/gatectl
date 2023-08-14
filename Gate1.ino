@@ -5,6 +5,7 @@
 #include "analog_in.hpp"
 #include "cli.hpp"
 #include "tunable.hpp"
+#include "log.hpp"
 
 #include <array>
 #include <sstream>
@@ -175,7 +176,7 @@ class App {
     }
     void start_task()
     {
-      ss << "Start Control Task" << std::endl;
+      lg::I() << "Start Control Task";
       xTaskCreatePinnedToCore([](void *app){ (*(App*)app).motor_task(); }, "motor_task", 10000, this, 0, &_mot_task, 1);
     }
     stats calc_stats() {
@@ -193,54 +194,7 @@ class App {
       s.rate = s.count * 1000000 / s.duration_us;
       return s;
     }
-    void test_motor_task() {
-      const uint16_t m = 8000;
-      const auto delay = 10;
-      unsigned pos = 0;
-      unsigned sha = _mot_angle();
-      unsigned sha_p = sha;
-      usleep(100000);
-      ss << "Preparing initial test conditions" << std::endl;
-      _mot_drive.enable();
-      _mot_drive.set(pos,m);
-      while (sha < 4000 || sha_p > 100) {
-        sha_p = sha;
-        sha = _mot_angle();
-        _mot_drive.set(pos--,m);
-        usleep(1000);
-      }
-      ss << "------------------------- Test Start -------------------------" << std::endl;
-      _mot_drive.set(--pos,m);
-      usleep(delay * 1000);
-      sha = _mot_angle();
-      sha_p = sha;
-      pos = pos & 255;
-      unsigned pos_p = pos;
-      ss << std::endl;
-      for (; pos < 12800 * 5; ++pos) {
-        sha_p = sha;
-        sha = _mot_angle();
-        if (sha != sha_p && sha > sha_p) {
-          ss << pos << ',' << sha << ',' << pos_p << ',' << sha_p << ',' << ((pos+pos_p)/2) << std::endl;
-          pos_p = pos;
-        }
-        _mot_drive.set(pos,m);
-        usleep(delay * 1000);
-      }
-      ss << std::endl;
-      for (; pos <= 12800 * 5; --pos) {
-        sha_p = sha;
-        sha = _mot_angle();
-        if (sha != sha_p && sha < sha_p) {
-          ss << pos << ',' << sha << ',' << pos_p << ',' << sha_p << ',' << ((pos+pos_p)/2) << std::endl;
-          pos_p = pos;
-        }
-        _mot_drive.set(pos,m);
-        usleep(delay * 1000);
-      }
-      ss << std::endl;
-      ss << "------------------------- Test End -------------------------" << std::endl;
-    }
+    void test_motor_task();
 
     AS5600PosnSensor _drive_angle;
     AS5600PosnSensor _mot_angle;
@@ -279,36 +233,53 @@ std::ostream & operator << (std::ostream & os, App const & app) {
   return os;
 }
 
-static App * app;
-
-static void print_state() {
-  app->reset_stats();
-  ss << (*app) << std::endl;
-}
-
-cli::Executor cli_exec;
-
-void setup() {
-  Serial.begin(115200);
-  Serial.setTimeout(2000);
-  // Primary I2C uses default pins, but we'll be explicit 
-  Wire.begin(21, 22);
-  // Secondary, containing our motor positon sensor
-  Wire1.begin(5,18, 400000);
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_0db);
-  tunable::set_cli_executor(cli_exec);
-  app = new App;
-
-  cli_exec.add_command("torque", [](int mnm){app->set_torque(mnm); return "Ok";}, "Set torque target, mNm");
-  cli_exec.add_command("drive", [](int mV){app->set_drive(mV); return "Ok";}, "Set drive voltage, mV");
-  cli_exec.add_command("disengage", [](){app->disengage(); return "Ok"; }, "Disengage drive");
-  cli_exec.add_command("stop", [](){return app->stop(); }, "Disengage drive, stop control task");
-  cli_exec.add_command("run", [](){return app->run(); }, "Start motor control task");
-  cli_exec.add_command("running", [](){return app->running(); }, "Is motor control task running?");
-  cli_exec.add_command("run-test", [](){return app->run_test(); }, "Run position calibration (if stopped)");
-  cli_exec.add_command("period", [](int ms){Serial.setTimeout(ms); return "Ok"; }, "Set status print interval, ms");
-  
+void App::test_motor_task() {
+  const uint16_t m = 8000;
+  const auto delay = 10;
+  unsigned pos = 0;
+  unsigned sha = _mot_angle();
+  unsigned sha_p = sha;
+  usleep(100000);
+  lg::Raw() << "Preparing initial test conditions" << std::endl;
+  _mot_drive.enable();
+  _mot_drive.set(pos,m);
+  while (sha < 4000 || sha_p > 100) {
+    sha_p = sha;
+    sha = _mot_angle();
+    _mot_drive.set(pos--,m);
+    usleep(1000);
+  }
+  lg::Raw() << "------------------------- Test Start -------------------------" << std::endl;
+  _mot_drive.set(--pos,m);
+  usleep(delay * 1000);
+  sha = _mot_angle();
+  sha_p = sha;
+  pos = pos & 255;
+  unsigned pos_p = pos;
+  lg::Raw() << std::endl;
+  for (; pos < 12800 * 5; ++pos) {
+    sha_p = sha;
+    sha = _mot_angle();
+    if (sha != sha_p && sha > sha_p) {
+      lg::Raw() << pos << ',' << sha << ',' << pos_p << ',' << sha_p << ',' << ((pos+pos_p)/2) << std::endl;
+      pos_p = pos;
+    }
+    _mot_drive.set(pos,m);
+    usleep(delay * 1000);
+  }
+  lg::Raw() << std::endl;
+  for (; pos <= 12800 * 5; --pos) {
+    sha_p = sha;
+    sha = _mot_angle();
+    if (sha != sha_p && sha < sha_p) {
+      lg::Raw() << pos << ',' << sha << ',' << pos_p << ',' << sha_p << ',' << ((pos+pos_p)/2) << std::endl;
+      pos_p = pos;
+    }
+    _mot_drive.set(pos,m);
+    usleep(delay * 1000);
+  }
+  lg::Raw() << std::endl;
+  lg::Raw() << "------------------------- Test End -------------------------" << std::endl;
 }
 
 // Wait indefinitely for user to enter a line of text on the serial interface, allowing for backspace, but ignoring ANSI
@@ -362,8 +333,40 @@ std::string serial_get_line(std::function<void()> idlefn)
   return line;
 }
 
+static App * app;
+
+static void print_state() {
+  app->reset_stats();
+  lg::I() << (*app);
+}
+
+cli::Executor cli_exec;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(2000);
+  // Primary I2C uses default pins, but we'll be explicit 
+  Wire.begin(21, 22);
+  // Secondary, containing our motor positon sensor
+  Wire1.begin(5,18, 400000);
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_0db);
+  tunable::set_cli_executor(cli_exec);
+  app = new App;
+
+  cli_exec.add_command("torque", [](int mnm){app->set_torque(mnm); return "Ok";}, "Set torque target, mNm");
+  cli_exec.add_command("drive", [](int mV){app->set_drive(mV); return "Ok";}, "Set drive voltage, mV");
+  cli_exec.add_command("disengage", [](){app->disengage(); return "Ok"; }, "Disengage drive");
+  cli_exec.add_command("stop", [](){return app->stop(); }, "Disengage drive, stop control task");
+  cli_exec.add_command("run", [](){return app->run(); }, "Start motor control task");
+  cli_exec.add_command("running", [](){return app->running(); }, "Is motor control task running?");
+  cli_exec.add_command("run-test", [](){return app->run_test(); }, "Run position calibration (if stopped)");
+  cli_exec.add_command("period", [](int ms){Serial.setTimeout(ms); return "Ok"; }, "Set status print interval, ms");
+  
+}
+
 void loop()
 {
   std::string line = serial_get_line(print_state);
-  Serial.println(cli_exec(line).c_str());
+  lg::Raw() << cli_exec(line).c_str() << std::endl;
 }

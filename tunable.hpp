@@ -29,9 +29,8 @@ class Item
     }
     void register_cmds(std::string const & name, cli::Executor & cli_exec)
     {
-      cli_exec.add_command(std::string("set-") + name, [this](T value){return this->set(value);}, std::string("Set ") + name + " tunable to value" );
+      cli_exec.add_command(std::string("set-") + name, [this](T value){return this->set(value);}, std::string("Set ") + name + " tunable to value (default value: " + std::to_string(_default) + ")" );
       cli_exec.add_command(std::string("get-") + name, [this](){return (*this)();}, std::string("Get ") + name + " tunable current value" );
-      cli_exec.add_command(std::string("def-") + name, [this](){return this->set_default();}, std::string("Restore ") + name + " tunable to default value (" + std::to_string(_default) + ")" );
     }
     operator T() const { return _value; }
     T operator() () const { return _value; }
