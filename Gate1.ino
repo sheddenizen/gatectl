@@ -1,3 +1,4 @@
+#include "log.hpp"
 #include "sin_lookup.hpp"
 #include "lp_filter.hpp"
 #include "commutator_ctl.hpp"
@@ -5,7 +6,7 @@
 #include "analog_in.hpp"
 #include "cli.hpp"
 #include "tunable.hpp"
-#include "log.hpp"
+#include "netw.hpp"
 
 #include <array>
 #include <sstream>
@@ -101,7 +102,7 @@ class App {
       , _batt_mv("Battery", "mV", 39, 0, 0, 2675, 12140)
       , _mot_drive({25,26,27,13}, 23)
       , _commutator(_mot_drive, _mot_angle, _batt_mv, 10000)
-      , _torque_servo("torq", 2000, 2000, 1000, 2)
+      , _torque_servo("torq", 3000, 2000, 1000, 2)
       {
         start_task();
       }
@@ -333,18 +334,60 @@ std::string serial_get_line(std::function<void()> idlefn)
   return line;
 }
 
+/*
+static std::string taskdump() {
+  using std::setw;
+  std::ostringstream out;
+  int ntask = uxTaskGetNumberOfTasks();
+  std::vector<TaskStatus_t> taskinfo(ntask);
+  uint32_t totalRunTime = 0;
+  uxTaskGetSystemState( &taskinfo[0], ntask, &totalRunTime );
+  for (auto task : taskinfo) {
+    out << setw(10) << task.pcTaskName << setw(3) << task.eCurrentState << setw(9) << task.ulRunTimeCounter << setw(4) << (task.ulRunTimeCounter * 100 / totalRunTime) << '%' << std::endl;
+  }
+  out << "Total Run time: " << totalRunTime;
+  return out.str();
+}
+*/
+
+static std::string taskinfo(std::string name) {
+  using std::setw;
+  std::ostringstream out;
+  auto handle = xTaskGetHandle(name.c_str());
+
+  std::array<char const *, 6> statenames = {{
+    "eRunning",
+    "eReady",
+    "eBlocked",
+    "eSuspended",
+    "eDeleted",
+    "eInvalid"
+  }};
+
+  if (handle) {
+    eTaskState state = eTaskGetState(handle);
+    out << name << " handle=" << handle << " state=" << statenames[state] << " (" << state << ")";
+  } else {
+    out << "Task, " << name << " not found";
+  }
+  return out.str();
+}
+
+
 static App * app;
+static Netw * netw;
 
 static void print_state() {
   app->reset_stats();
-  lg::I() << (*app);
+  lg::I() << (*app) << " Wifi: " << netw->wifi_state();
+  lg::LogStream::Instance().print();
 }
 
 cli::Executor cli_exec;
 
 void setup() {
   Serial.begin(115200);
-  Serial.setTimeout(2000);
+  Serial.setTimeout(1000);
   // Primary I2C uses default pins, but we'll be explicit 
   Wire.begin(21, 22);
   // Secondary, containing our motor positon sensor
@@ -362,11 +405,16 @@ void setup() {
   cli_exec.add_command("running", [](){return app->running(); }, "Is motor control task running?");
   cli_exec.add_command("run-test", [](){return app->run_test(); }, "Run position calibration (if stopped)");
   cli_exec.add_command("period", [](int ms){Serial.setTimeout(ms); return "Ok"; }, "Set status print interval, ms");
-  
+  cli_exec.add_command("taskinfo", taskinfo, "Dump status of specified task");
+  cli_exec.add_command("log", [](unsigned level){lg::LogStream::Instance().set_log_level(level); return level; }, "Set log level, 0-5");
+
+  netw = new Netw();
+  netw->start();
 }
 
 void loop()
 {
   std::string line = serial_get_line(print_state);
   lg::Raw() << cli_exec(line).c_str() << std::endl;
+  lg::LogStream::Instance().print();
 }

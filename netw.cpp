@@ -150,8 +150,6 @@ static void mqtt_app_start()
   esp_mqtt_client_start(client);
 }
 
-
-
 static void find_ap(){
 
   static WiFiMulti wifiMulti;
@@ -187,68 +185,66 @@ static void setup_net() {
   }
 }
 
+void Netw::start()
+{
+  lg::I() << "Start Net Task";
+  xTaskCreatePinnedToCore([](void *obj){ (*(Netw*)obj).task(); }, "net_task", 10000, this, 0, &_net_task, 0);
+}
 
 void Netw::task()
 {
   //uint32_t last_send = 0;
   wl_status_t wifi_last = WL_NO_SHIELD;
-  bool first_connect = true;
+  unsigned scan_countdown = 1;
   lg::D() << "Comms Task" ;
 
   // 100ms makes it bootloop a few times, 200ms is ok... wtf
-  delay(200);
-  lg::I() <<"Starting comms";
+  vTaskDelay(_delayms / portTICK_PERIOD_MS);
+  lg::I() << "Starting Wi-fi";
 
   setup_net();
-
+  if(0)
+    mqtt_app_start();
   for (;;) {
-    delay(200);
-    uint32_t now_ms = uint32_t(esp_timer_get_time()/1000ll);
 
     wl_status_t wifi_state = WiFi.status();
 
-    while (wifi_state != wifi_last) {
+    if (wifi_state != wifi_last) {
       lg::I() << "Wifi state change: " << wifi_state << " (was "  << wifi_last << ")";
       lg::I() << "Wifi ssid: " << WiFi.SSID();
-      if (wifi_state == WL_CONNECTED && first_connect) {
-        lg::D() << "Wifi good, starting mqtt";
-        mqtt_app_start();
-        lg::D() << "Started mqtt";
-        first_connect = false;
-      }
       wifi_last = wifi_state; 
+    } else {
+          vTaskDelay(_delayms / portTICK_PERIOD_MS);
     }
-    if (wifi_state ==  WL_NO_SSID_AVAIL) {
+    if ((wifi_state == WL_CONNECTED) != _connected) {
+      _connected = wifi_state == WL_CONNECTED;
+      if (_notifyfn)
+        _notifyfn(_connected);
+    }
+    if (wifi_state ==  WL_NO_SSID_AVAIL && --scan_countdown == 0) {
+      scan_countdown = 5;
       lg::I() <<"No SSID, scanning";
       find_ap();
       lg::I() <<"Status now " << WiFi.status();
     }
-
-    if (wifi_state != WL_CONNECTED) {
-      return;
-    }
-
-    if (!mqtt_connected) {
-      lg::W() << "MQTT not connected after " << now_ms << "ms";
-      return;
-    }
-
-    static bool mqtt_pending = false;
-    if (esp_mqtt_client_get_outbox_size(client)) {
-      if (!mqtt_pending)
-        lg::W() << "MQTT message pending " << mqtt_pending;
-      mqtt_pending = true;
-    } else {
-      if (mqtt_pending)
-        lg::W() << "MQTT message cleared " << mqtt_pending;
-      mqtt_pending = false;
-    }
-/*
-    uint32_t send_interval_ms = state == state_idle ? send_interval_idle_ms : send_interval_active_ms;
-    if ((last_send == 0  || now_ms - last_send > send_interval_ms) && !mqtt_pending) {
-      // mqtt_send_status(client);
-      last_send = now_ms;
-    }
-*/
   }
+}
+
+std::ostream & operator << (std::ostream & os,  wl_status_t state) {
+  static const std::array<char const *, 7> statenames = {{
+    "WL_IDLE_STATUS",
+    "WL_NO_SSID_AVAIL",
+    "WL_SCAN_COMPLETED",
+    "WL_CONNECTED",
+    "WL_CONNECT_FAILED",
+    "WL_CONNECTION_LOST",
+    "WL_DISCONNECTED"
+  }};
+  if (state < statenames.size())
+    os << statenames[state];
+  else if (state == 255)
+    os << "WL_NO_SHIELD";
+  else
+    os << "Unknown";
+  return os;
 }

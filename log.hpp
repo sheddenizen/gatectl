@@ -7,17 +7,62 @@
 
 namespace lg {
 
+
+class LogStream {
+    static constexpr auto sizeThres = 4096;
+  public:
+    static LogStream & Instance()
+    {
+      static LogStream ls;
+      return ls;
+    }
+    void add(unsigned level, std::ostringstream & ss) {
+      if (level > _log_level)
+        return;
+      if (xSemaphoreTake(_mutex, 1000 / portTICK_PERIOD_MS)) {
+        if (_log.size() < sizeThres) {
+          _log += ss.str();
+        } else {
+          ++_overflow_count;
+        }
+        xSemaphoreGive(_mutex);
+      }
+    }
+    void print() {
+      if (xSemaphoreTake(_mutex, 1000 / portTICK_PERIOD_MS)) {
+        Serial.print(_log.c_str());
+        if (_overflow_count)
+          Serial.print("Log overflow, ");
+          Serial.print(_overflow_count);
+          Serial.println(" entries lost");
+        _log.clear();
+        xSemaphoreGive(_mutex);
+      }
+    }
+    void set_log_level(unsigned level) { _log_level = level; }
+  private:
+    LogStream()
+      : _mutex(xSemaphoreCreateMutex())
+    {}
+    std::string _log;
+    SemaphoreHandle_t _mutex;
+    unsigned _overflow_count = 0;
+    unsigned _log_level = 5;
+};
+
 class Raw {
   public:
     Raw() {}
-    ~Raw() { Serial.print(_ss.str().c_str()); }
+    ~Raw() { LogStream::Instance().add(0, _ss); }
     std::ostream & operator()() { return _ss; }
     template <typename T>
     std::ostream & operator << (T const & v) { return _ss << v; }
     std::ostream & operator << (std::ostream & (fn)( std::ostream & )){ return _ss << fn; }
     template<typename... Args>
     void printf(char const * fmt, Args const &...args) {
-      Serial.printf(fmt, args...);
+        std::vector<char> buf(1024, 0);
+        snprintf(&buf[0], buf.size()-1, fmt, args...);
+        _ss << &buf[0];
     }
   private:
     std::ostringstream _ss;
@@ -33,7 +78,7 @@ class Entry {
     ~Entry()
     {
       _ss << std::endl;
-      Serial.print(_ss.str().c_str());
+      LogStream::Instance().add(level, _ss);
     }
     std::ostream & operator()() { return _ss; }
     std::ostream & if_true(bool cond) {
@@ -51,11 +96,9 @@ class Entry {
 
     template<typename... Args>
     void printf(char const * fmt, Args const &...args) {
-        constexpr auto smax  = 1024;
-        char *buf = new char[smax];
-        snprintf(buf, smax-1, fmt, args...);
-        buf[smax-1] = 0;
-        _ss << buf;
+        std::vector<char> buf(1024, 0);
+        snprintf(&buf[0], buf.size()-1, fmt, args...);
+        _ss << &buf[0];
     }
 
   private:
