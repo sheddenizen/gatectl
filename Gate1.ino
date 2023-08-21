@@ -7,6 +7,7 @@
 #include "cli.hpp"
 #include "tunable.hpp"
 #include "netw.hpp"
+#include "mqtt.hpp"
 
 #include <array>
 #include <sstream>
@@ -376,6 +377,7 @@ static std::string taskinfo(std::string name) {
 
 static App * app;
 static Netw * netw;
+static Mqtt * mqtt;
 
 static void print_state() {
   app->reset_stats();
@@ -408,7 +410,16 @@ void setup() {
   cli_exec.add_command("taskinfo", taskinfo, "Dump status of specified task");
   cli_exec.add_command("log", [](unsigned level){lg::LogStream::Instance().set_log_level(level); return level; }, "Set log level, 0-5");
 
-  netw = new Netw();
+  netw = new Netw("gatectl", [](bool connected) {
+    lg::D() << "Notify network " << (connected ? "connected" : "disconnected");
+    if (connected)
+      mqtt->start();
+  });
+  mqtt = new Mqtt(netw->hostname(), std::string("gatectl/v1/") + netw->hostname() + "/");
+  mqtt->subscribe("cmd", [](std::string topic, std::string payload) {
+    // Mind the stack!
+    mqtt->send("response", cli_exec(payload));
+  });
   netw->start();
 }
 

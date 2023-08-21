@@ -11,18 +11,17 @@
 
 class Netw {
   public:
-    explicit Netw(std::function<void(bool)> notifyfn = std::function<void(bool)>(), unsigned delayms = 400)
-      : _notifyfn(notifyfn)
-      , _delayms(delayms)
-    {}
+    explicit Netw(std::string hostnamebase, std::function<void(bool)> notifyfn = std::function<void(bool)>(), unsigned delayms = 400);
     void start();
     void set_notify(std::function<void(bool)> notifyfn) { _notifyfn = notifyfn; }
     void set_delay(unsigned delayms) { _delayms = delayms; }
     bool connected() const { return _connected; }
     wl_status_t wifi_state() const { return WiFi.status(); }
+    std::string const & hostname() const { return _hostname; }
   private:
     void task();
-    std:: string _hostname;
+    void setup_net();
+    std::string _hostname;
     bool _connected = false;
     TaskHandle_t _net_task = 0;
     std::function<void(bool)> _notifyfn;
@@ -31,12 +30,6 @@ class Netw {
 
 std::ostream & operator << (std::ostream & os,  wl_status_t state);
 
-class Mqtt {
-  public:
-    Mqtt() {}
-  private:
-
-};
 
 #endif // NETW_HPP
 

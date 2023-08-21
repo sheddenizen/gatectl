@@ -31,10 +31,11 @@ class LogStream {
     void print() {
       if (xSemaphoreTake(_mutex, 1000 / portTICK_PERIOD_MS)) {
         Serial.print(_log.c_str());
-        if (_overflow_count)
+        if (_overflow_count) {
           Serial.print("Log overflow, ");
           Serial.print(_overflow_count);
           Serial.println(" entries lost");
+        }
         _log.clear();
         xSemaphoreGive(_mutex);
       }
