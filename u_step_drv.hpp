@@ -60,6 +60,7 @@ class UStepDrv {
       }
       _en = false;
     }
+    constexpr uint32_t freq() const { return _freq; }
   private:
     unsigned _ledc_offs;
     const std::array<uint8_t, 4> _phase_pins;

@@ -1,6 +1,8 @@
 #ifndef AS5600_HPP
 #define AS5600_HPP
 
+#include "log.hpp"
+
 #include "Arduino.h"
 #include "Wire.h"
 #include <stdint.h>
@@ -16,11 +18,14 @@ class AS5600PosnSensor {
       _i2c.write(uint8_t(0xc));
       _i2c.endTransmission();
       _i2c.requestFrom(0x36, 2);
-      uint8_t count = 0;
+      int retries = 1;
+      int byte_count;
 
-      while ((count = _i2c.available()) < 2) {
-        Serial.printf("Wait %hhu\n", count);
-        delay(100);
+      while ((byte_count = _i2c.available()) < 2 && --retries) {
+        lg::W() << "Sensor " << _name << " got " << byte_count << " bytes with " << retries << " retries left";
+        delay(10);
+        if (!retries)
+          return _last_raw;
       }
       uint16_t val = _i2c.read();
       val = (val << 8) | _i2c.read();

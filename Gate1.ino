@@ -17,27 +17,6 @@
 
 #include "cal_data.hpp"
 
-class SerialStream {
-  public:
-    std::ostringstream _buf;
-};
-// Dodgy hackery!
-template<typename T>
-SerialStream & operator << (SerialStream & ss, T const & x) {
-  using namespace cli;
-  ss._buf << x;
-  return ss;
-}
-
-SerialStream & operator << (SerialStream & ss, std::ostream & (fn)( std::ostream & )){
-  ss._buf << fn;
-  Serial.print(ss._buf.str().c_str());
-  ss._buf.str("");
-  return ss;
-}
-
-SerialStream ss;
-
 
 class Servo {
   public:
@@ -142,6 +121,26 @@ class App {
     void disengage() {
       _torque_mode = false;
       _commutator.disengage();
+    }
+    int mot_direct_step(unsigned angle, unsigned magmv) {
+      if (_run)
+        return -1;
+      unsigned magabs = (magmv << 16) / _batt_mv();
+      _mot_drive.enable();
+      _mot_drive.set(angle, magabs);
+      // Result: pulse width in us, trying not to overflow - 15625/1024 = 10^6 / 2^16
+      return magabs * 15625 / _mot_drive.freq() / 1024;
+    }
+    std::tuple<int, int> get_phase_currents() {
+      int aav = 0;
+      int bav = 0;
+      constexpr int count = 1000;
+      for (int n = 0 ; n < count; ++n) {
+        aav += _mot_current_a();
+        bav += _mot_current_b();
+        usleep(1000);
+      }
+      return std::make_tuple(aav/count,bav/count);
     }
     void reset_stats()
     {
@@ -396,6 +395,9 @@ void setup() {
   Wire1.begin(5,18, 400000);
   analogReadResolution(12);
   analogSetAttenuation(ADC_0db);
+
+  begin(unsigned long baud, uint32_t Serial1config=SERIAL_8N1, int8_t rxPin=-1, int8_t txPin=-1, bool invert=false, unsigned long timeout_ms = 20000UL, uint8_t rxfifo_full_thrhd = 112);
+    void end(bool fullyTerminate = true);
   tunable::set_cli_executor(cli_exec);
   app = new App;
 
@@ -406,6 +408,8 @@ void setup() {
   cli_exec.add_command("run", [](){return app->run(); }, "Start motor control task");
   cli_exec.add_command("running", [](){return app->running(); }, "Is motor control task running?");
   cli_exec.add_command("run-test", [](){return app->run_test(); }, "Run position calibration (if stopped)");
+  cli_exec.add_command("abs-test", [](unsigned angle, unsigned mv){return app->mot_direct_step(angle, mv); }, "Set absolute step angle and voltage (if stopped), return pwm on time, us");
+  cli_exec.add_command("mot-current", [](){return app->get_phase_currents(); }, "Read motor phase currents");
   cli_exec.add_command("period", [](int ms){Serial.setTimeout(ms); return "Ok"; }, "Set status print interval, ms");
   cli_exec.add_command("taskinfo", taskinfo, "Dump status of specified task");
   cli_exec.add_command("log", [](unsigned level){lg::LogStream::Instance().set_log_level(level); return level; }, "Set log level, 0-5");
@@ -426,6 +430,6 @@ void setup() {
 void loop()
 {
   std::string line = serial_get_line(print_state);
-  lg::Raw() << cli_exec(line).c_str() << std::endl;
+  lg::Raw() << cli_exec(line) << std::endl;
   lg::LogStream::Instance().print();
 }

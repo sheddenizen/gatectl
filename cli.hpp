@@ -44,7 +44,7 @@ namespace aux {
     template <int N, typename... VN>
     void write_tuple(ostream & os, false_type, tuple<VN...> const &t)
     {
-      os << std::get<sizeof...(VN)-N>(t);
+      os << std::get<sizeof...(VN)-N>(t) << (N > 1 ? " " :"");
       if (os.good())
         write_tuple<N-1>(os, is_zero<N-1>(), t);
     }
