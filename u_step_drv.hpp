@@ -41,7 +41,7 @@ class UStepDrv {
     void set(unsigned a, uint16_t m) {
       for (int n = 0; n < 2 ; ++n) {
         auto ph = sin_lookup(a + n * 64);
-        uint32_t duty = dt_comp(_freq, _deadtime_us[n]) + ((m * ph.first) >> (32 - _pwm_bits));
+        uint32_t duty = dt_comp(_freq, _deadtime_ns[ (n << 1) + ph.second ? 1 : 0]) + ((m * ph.first) >> (32 - _pwm_bits));
         duty = duty > _pwm_max ? _pwm_max : duty;
         auto chan = _ledc_offs + n * 2; 
         ledcWrite(chan + (ph.second ? 1 : 0), _pwm_max - duty);
@@ -67,9 +67,9 @@ class UStepDrv {
     const uint8_t _inh_pin;
     static constexpr auto _pwm_bits = 12;
     static const auto _pwm_max = (1 << _pwm_bits) -1;
-    static constexpr std::array<uint32_t, 2> _deadtime_us = { 6, 6 };
+    static constexpr std::array<uint32_t, 4> _deadtime_ns = { 4100, 5600, 5400, 8200 };
     static constexpr auto _freq = 15625;
-    static constexpr uint32_t dt_comp(uint32_t freq, uint32_t deadtime_us) { return (1 << _pwm_bits) * deadtime_us * _freq / 1000000; }
+    static constexpr uint32_t dt_comp(uint32_t freq, uint32_t deadtime_ns) { return ((deadtime_ns << _pwm_bits) / 1000) * _freq / 1000000; }
     unsigned _angle = 0;
     bool _en = false;
     uint16_t _mag = 0;
