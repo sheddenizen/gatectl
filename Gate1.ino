@@ -3,6 +3,7 @@
 #include "lp_filter.hpp"
 #include "commutator_ctl.hpp"
 #include "as5600.hpp"
+#include "pcf8574.hpp"
 #include "analog_in.hpp"
 #include "cli.hpp"
 #include "tunable.hpp"
@@ -74,7 +75,8 @@ class App {
       unsigned rate = 0;
     };
     App()
-      : _drive_angle("Drive", Wire, 0)
+      : _i2cgpio1("RemoteGpio", Wire, 0)
+      , _drive_angle("Drive", Wire, 0)
       , _mot_angle("Mot", Wire1, 0)
       , _mot_current_a("Mot Phase A", "mA", 34, 64, 0, 1305, 3320)
       , _mot_current_b("Mot Phase B", "mA", 35, 62, 0, 1200, 3001)
@@ -142,6 +144,7 @@ class App {
       }
       return std::make_tuple(aav/count,bav/count);
     }
+    PCF8574Gpio const get_i2c_gpio1() { return _i2cgpio1; }
     void reset_stats()
     {
       _last_stats = calc_stats();
@@ -197,6 +200,7 @@ class App {
     }
     void test_motor_task();
 
+    PCF8574Gpio _i2cgpio1;
     AS5600PosnSensor _drive_angle;
     AS5600PosnSensor _mot_angle;
     AnalogIn _mot_current_a;
@@ -231,6 +235,7 @@ std::ostream & operator << (std::ostream & os, App const & app) {
      << app._drive_angle << ' ' 
      << app._commutator
      << ' ' << app._mot_current_a << ' ' << app._mot_current_b;
+     << app._i2cgpio1;
   return os;
 }
 
@@ -411,6 +416,8 @@ void setup() {
   cli_exec.add_command("abs-test", [](unsigned angle, unsigned mv){return app->mot_direct_step(angle, mv); }, "Set absolute step angle and voltage (if stopped), return pwm on time, us");
   cli_exec.add_command("mot-current", [](){return app->get_phase_currents(); }, "Read motor phase currents");
   cli_exec.add_command("period", [](int ms){Serial.setTimeout(ms); return "Ok"; }, "Set status print interval, ms");
+  cli_exec.add_command("get-i2c-gpio", [](){return app->get_i2c_gpio1(); }, "Get i2c gpio 1 state");
+  cli_exec.add_command("get-i2c-gpio1", [](){return unsigned(app->get_i2c_gpio1().get()); }, "Get i2c gpio 1 inputs");
   cli_exec.add_command("taskinfo", taskinfo, "Dump status of specified task");
   cli_exec.add_command("log", [](unsigned level){lg::LogStream::Instance().set_log_level(level); return level; }, "Set log level, 0-5");
 

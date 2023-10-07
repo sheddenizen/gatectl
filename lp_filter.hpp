@@ -4,7 +4,7 @@
 #include "stdint.h"
 #include <array>
 
-
+// Discrete, fixed point, low-pass, butterworth filter
 class LpFilter {
     struct lpf_params_t {
         int32_t gain;
@@ -14,6 +14,7 @@ class LpFilter {
     static std::array<LpFilter::lpf_params_t, 11> const cooked_params;
     static auto constexpr order = 2;
   public:
+    // Create filter: ff_percent = Knee frequency as percent of sample rate, input_max_val = maximum input value used to set precision
     LpFilter(int32_t ff_percent, int32_t input_max_val);
     int32_t operator() (int32_t sample);
   private:
