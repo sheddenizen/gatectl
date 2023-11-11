@@ -17,18 +17,22 @@ class Netw {
     void set_delay(unsigned delayms) { _delayms = delayms; }
     bool connected() const { return _connected; }
     wl_status_t wifi_state() const { return WiFi.status(); }
+    void poll();
+    void setup_net();
     std::string const & hostname() const { return _hostname; }
   private:
     void task();
-    void setup_net();
     std::string _hostname;
     bool _connected = false;
     TaskHandle_t _net_task = 0;
     std::function<void(bool)> _notifyfn;
     unsigned _delayms;
+    wl_status_t _wifi_last = WL_NO_SHIELD;
+    unsigned _scan_countdown = 1;
 };
 
 std::ostream & operator << (std::ostream & os,  wl_status_t state);
+std::ostream & operator << (std::ostream & os,  Netw const & nw);
 
 
 #endif // NETW_HPP

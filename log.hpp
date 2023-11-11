@@ -74,7 +74,8 @@ class Entry {
   public:
     Entry() {
       char p[] = { prefx... , ':', ' ', 0 };
-      _ss << p;
+      if (! _ss.bad())
+        _ss << p;
     }
     ~Entry()
     {

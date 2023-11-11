@@ -13,7 +13,7 @@ class AS5600PosnSensor {
     static constexpr uint16_t mask = (1 << resbits) - 1;
     explicit AS5600PosnSensor(char const * name, TwoWire & i2c, uint16_t offset) 
       : _name(name), _i2c(i2c), _offset(offset) {}
-    uint16_t raw() const {
+    uint16_t raw() {
       _i2c.beginTransmission(0x36);
       _i2c.write(uint8_t(0xc));
       _i2c.endTransmission();
@@ -23,31 +23,36 @@ class AS5600PosnSensor {
 
       while ((byte_count = _i2c.available()) < 2 && --retries) {
         lg::W() << "Sensor " << _name << " got " << byte_count << " bytes with " << retries << " retries left";
-        delay(10);
-        if (!retries)
+        delay(1);
+        if (!retries) {
+          _error = true;
           return _last_raw;
+        }
       }
       uint16_t val = _i2c.read();
       val = (val << 8) | _i2c.read();
-      const_cast<uint16_t &>(_last_raw) = val;
+      _last_raw = val;
+      _error = false;
       return val;      
     }
-    uint16_t operator()() const { return (raw() + _offset) & mask; }
+    uint16_t operator()() { return (raw() + _offset) & mask; }
     uint16_t degr(uint16_t raw_val) const 
     { return ((raw_val + _offset) & mask) * 360 / (1 << resbits); }
-    uint16_t degr() const { return degr(raw()); }
+    uint16_t degr() { return degr(raw()); }
     uint16_t last_raw() const { return _last_raw; }
     char const * name() const { return _name; }
+    bool error() const { return _error; }
 
   private:
     char const * const _name;
     TwoWire & _i2c;
     uint16_t _offset;
     uint16_t _last_raw;
+    bool _error = false;
 };
 
 std::ostream & operator << (std::ostream & os, AS5600PosnSensor const & sens) {
-  uint16_t raw=sens.raw();
+  uint16_t raw=sens.last_raw();
   os << sens.name() << '=' << sens.degr(raw) << "deg(" << raw << ')';
   return os;
 }

@@ -33,20 +33,21 @@ static void find_ap(){
   static bool first = true;
 
   if (first) {
-    for (auto ssp = &wpa_ssids[0]; ssp->first[0] != 0; ++ssp) {
-      lg::D() << "Adding SSID, %s" << ssp->first;
-      wifiMulti.addAP(ssp->first, ssp->second);
+    for (auto & ssp : wpa_ssids) {
+      lg::D() << "Adding SSID, %s" << ssp.first;
+      wifiMulti.addAP(ssp.first, ssp.second);
     }
     first = false;
   }
   lg::D() << "wifi multi run";
   uint8_t wifi_init = wifiMulti.run();
-  lg::D() << "wifi multi result %d " <<  wifi_init << " on ssid " << WiFi.SSID();
+  lg::D() << "wifi multi result %d " <<  wifi_init;
 }
 
 
-void Netw::setup_net() {
-
+void Netw::setup_net()
+{
+  lg::I() << "Starting Wi-fi";
   WiFi.setHostname(_hostname.c_str());
 
   // WiFi.begin(ssid, password);
@@ -60,44 +61,41 @@ void Netw::setup_net() {
 
 void Netw::start()
 {
+  vTaskDelay(_delayms / portTICK_PERIOD_MS);
   lg::I() << "Start Net Task";
-  xTaskCreatePinnedToCore([](void *obj){ (*(Netw*)obj).task(); }, "net_task", 10000, this, 0, &_net_task, 0);
+  xTaskCreatePinnedToCore([](void *obj){ (*(Netw*)obj).task(); }, "net_task", 15000, this, 0, &_net_task, 0);
+}
+
+void Netw::poll()
+{
+    // 100ms makes it bootloop a few times, 200ms is ok... wtf
+    wl_status_t _wifi_state = WiFi.status();
+
+    if (_wifi_state != _wifi_last) {
+      lg::I() << "Wifi state change: " << _wifi_state << " (was "  << _wifi_last << ")" << " ssid: " << WiFi.SSID();
+      _wifi_last = _wifi_state;
+    } else {
+          vTaskDelay(_delayms / portTICK_PERIOD_MS);
+    }
+    if ((_wifi_state == WL_CONNECTED) != _connected) {
+      _connected = _wifi_state == WL_CONNECTED;
+      if (_notifyfn)
+        _notifyfn(_connected);
+    }
+    if (_wifi_state ==  WL_NO_SSID_AVAIL && --_scan_countdown == 0) {
+      _scan_countdown = 5;
+      lg::I() <<"No SSID, scanning";
+      find_ap();
+      lg::I() <<"Status now " << WiFi.status();
+    }  
 }
 
 void Netw::task()
 {
   //uint32_t last_send = 0;
-  wl_status_t wifi_last = WL_NO_SHIELD;
-  unsigned scan_countdown = 1;
   lg::D() << "Comms Task" ;
-
-  // 100ms makes it bootloop a few times, 200ms is ok... wtf
-  vTaskDelay(_delayms / portTICK_PERIOD_MS);
-  lg::I() << "Starting Wi-fi";
-
   setup_net();
   for (;;) {
-
-    wl_status_t wifi_state = WiFi.status();
-
-    if (wifi_state != wifi_last) {
-      lg::I() << "Wifi state change: " << wifi_state << " (was "  << wifi_last << ")";
-      lg::I() << "Wifi ssid: " << WiFi.SSID();
-      wifi_last = wifi_state; 
-    } else {
-          vTaskDelay(_delayms / portTICK_PERIOD_MS);
-    }
-    if ((wifi_state == WL_CONNECTED) != _connected) {
-      _connected = wifi_state == WL_CONNECTED;
-      if (_notifyfn)
-        _notifyfn(_connected);
-    }
-    if (wifi_state ==  WL_NO_SSID_AVAIL && --scan_countdown == 0) {
-      scan_countdown = 5;
-      lg::I() <<"No SSID, scanning";
-      find_ap();
-      lg::I() <<"Status now " << WiFi.status();
-    }
   }
 }
 
@@ -118,4 +116,8 @@ std::ostream & operator << (std::ostream & os,  wl_status_t state) {
   else
     os << "Unknown";
   return os;
+}
+
+std::ostream & operator << (std::ostream & os,  Netw const & nw) {
+  return os << WiFi.status() << "(" << WiFi.SSID().c_str() << ")";
 }

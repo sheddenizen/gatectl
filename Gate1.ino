@@ -9,6 +9,7 @@
 #include "tunable.hpp"
 #include "netw.hpp"
 #include "mqtt.hpp"
+#include "Update.h"
 
 #include <array>
 #include <sstream>
@@ -76,31 +77,32 @@ class App {
     };
     App()
       : _i2cgpio1("RemoteGpio", Wire, 0)
-      , _drive_angle("Drive", Wire, 0)
+      , _drive_angle("Drive", Wire, -1260)
       , _mot_angle("Mot", Wire1, 0)
       , _mot_current_a("Mot Phase A", "mA", 34, 64, 0, 1305, 3320)
       , _mot_current_b("Mot Phase B", "mA", 35, 62, 0, 1200, 3001)
-      , _torque("Torque", "mNm", 36, 1725, 0, 1560, -805)
+      , _torque("Torque", "mNm", 36, 1725, 0, 1560, -7897)
       , _batt_mv("Battery", "mV", 39, 0, 0, 2675, 12140)
       , _mot_drive({25,26,27,13}, 23)
       , _commutator(_mot_drive, _mot_angle, _batt_mv, 10000)
-      , _torque_servo("torq", 3000, 2000, 1000, 2)
+      , _torque_servo("torq", 3000, 500, 1000, 2)
       {
-        start_task();
+        start_motor_task();
+        start_control_task();
       }
-
+    void set_telem_sender(std::function<void(std::string const &)> fn) { _telem_send_fn = fn; }
     bool run()
     {
       if (_run)
-        vTaskDelay(50 / portTICK_PERIOD_MS);
+        vTaskDelay(1);
       vTaskResume(_mot_task);
-      vTaskDelay(50 / portTICK_PERIOD_MS);
+      vTaskDelay(1);
       return _run;
     }
     bool stop()
     {
       _run = false;
-      vTaskDelay(50 / portTICK_PERIOD_MS);
+      vTaskDelay(1);
       return !_run;
     }
     bool run_test() { 
@@ -178,10 +180,99 @@ class App {
         _run = true;
       }
     }
-    void start_task()
+    void start_motor_task()
+    {
+      lg::I() << "Start Motor Task";
+      xTaskCreatePinnedToCore([](void *app){ (*(App*)app).motor_task(); }, "motor_task", 15000, this, 0, &_mot_task, 1);
+    }
+    static constexpr bool open_btn(uint8_t x) { return (x & 1<<7) != 0; }
+    static constexpr bool close_btn(uint8_t x) { return (x & 1<<6) != 0; }
+    static constexpr bool stop_btn(uint8_t x) { return (x & 1<<4) != 0; }
+    void control_task()
+    {
+      constexpr int intervalms = 10;
+      int torq_target = 0;
+      unsigned count = 0;
+      uint8_t last_ctl_in = 0x0f;
+      vTaskDelay(2000 / portTICK_PERIOD_MS);
+      lg::I() << "Start control loop";
+      unsigned long tms = millis();
+      unsigned long ttarg = tms - tms % intervalms;
+      unsigned error_count = 0;
+ 
+      for (;;) {
+        ttarg += intervalms;
+        tms = millis();
+        int sleept = int(ttarg - tms);
+        if (sleept < -intervalms || sleept > intervalms) {
+          lg::E() << "Control loop time correction, target: " << ttarg << ", now: " << tms;
+          ttarg = tms - tms % intervalms + intervalms;
+          sleept = int(ttarg - tms);
+        }
+        if (sleept < 0)
+          sleept = 0;
+        vTaskDelay(sleept / portTICK_PERIOD_MS);
+        tms = millis();
+        ++count;
+        uint8_t ctl_in = _i2cgpio1.get();
+        uint8_t ctl_new = (~last_ctl_in & ctl_in);
+        last_ctl_in = ctl_in;
+        if (open_btn(ctl_new)) {
+          lg::I() << "Open Btn " << _i2cgpio1;
+          torq_target -= 5000;
+          run();
+        }
+        if (close_btn(ctl_new)) {
+          torq_target += 5000;
+          lg::I() << "Close Btn " << _i2cgpio1;
+          run();
+        }
+        if (stop_btn(ctl_new)) {
+          torq_target = 0;
+          lg::I() << "STOP Btn " << _i2cgpio1;
+          stop();
+        }
+        if (ctl_new)
+          set_torque(torq_target);
+
+        int16_t drive_angle = _drive_angle();
+
+        if (_drive_angle.error() || _mot_angle.error()) {
+          if (error_count == 0)
+            lg::E() << "Sensor Error, Drive: " << _drive_angle.error() << " Motor: " << _mot_angle.error();
+          error_count++;
+        } else if (error_count) {
+          lg::W() << "Sensor Error cleared at error count: " << error_count;
+          error_count = 0;
+        }
+
+        if (count % (running() ? 50 : 500) == 0) {
+          reset_stats();
+          auto s = get_last_stats();
+          std::ostringstream os;
+          os << "{\"run\":" << running()
+             << ",\"dr_a\":" << drive_angle
+             << ",\"Vb_mV\":" << _batt_mv()
+             << ",\"Tup_ms\":" << tms
+             << ",\"N\":" << count;
+          if (running()) {
+            os << ",\"f_Hz\":" << s.rate
+              << ",\"sp_Hz\":" << s.speed
+              << ",\"Ia_mA\":" << s.mot_i_a
+              << ",\"Ib_mA\":" << s.mot_i_b
+              << ",\"Vd_mV\":" << s.drive
+              << ",\"Ta_Nm\":" << s.torque 
+              << ",\"Tt_Nm\":" << torq_target;
+          }
+          os << "}";
+          _telem_send_fn(os.str());
+        }
+      }
+    }
+    void start_control_task()
     {
       lg::I() << "Start Control Task";
-      xTaskCreatePinnedToCore([](void *app){ (*(App*)app).motor_task(); }, "motor_task", 10000, this, 0, &_mot_task, 1);
+      xTaskCreatePinnedToCore([](void *app){ (*(App*)app).control_task(); }, "control_task", 15000, this, 0, &_ctrl_task, 0);
     }
     stats calc_stats() {
       stats s = _stats;
@@ -212,10 +303,12 @@ class App {
     Servo _torque_servo;
     bool _torque_mode = false;
     TaskHandle_t _mot_task = 0;
+    TaskHandle_t _ctrl_task =0;
     bool _run = false;
     unsigned _count = 0;
     stats _stats;
     stats _last_stats;
+    std::function<void(std::string const &)> _telem_send_fn;
     friend std::ostream & operator << (std::ostream & os, App const & app);
 };
 
@@ -232,9 +325,9 @@ std::ostream & operator << (std::ostream & os, App::stats const & s) {
 std::ostream & operator << (std::ostream & os, App const & app) {
   os << (app._run ? "Run " : "Stop ")
      << app.get_last_stats() << ' '
-     << app._drive_angle << ' ' 
+     << "Drive=" << app._drive_angle << ' ' 
      << app._commutator
-     << ' ' << app._mot_current_a << ' ' << app._mot_current_b;
+     << ' ' << app._mot_current_a << ' ' << app._mot_current_b
      << app._i2cgpio1;
   return os;
 }
@@ -371,7 +464,7 @@ static std::string taskinfo(std::string name) {
 
   if (handle) {
     eTaskState state = eTaskGetState(handle);
-    out << name << " handle=" << handle << " state=" << statenames[state] << " (" << state << ")";
+    out << name << " handle=" << handle << " state=" << statenames[state] << " (" << state << ")" << " stack high water=" << uxTaskGetStackHighWaterMark(handle);
   } else {
     out << "Task, " << name << " not found";
   }
@@ -384,8 +477,8 @@ static Netw * netw;
 static Mqtt * mqtt;
 
 static void print_state() {
-  app->reset_stats();
-  lg::I() << (*app) << " Wifi: " << netw->wifi_state();
+  netw->poll();
+  lg::I() << (*app) << " Wifi: " << netw;
   lg::LogStream::Instance().print();
 }
 
@@ -419,6 +512,8 @@ void setup() {
   cli_exec.add_command("get-i2c-gpio", [](){return app->get_i2c_gpio1(); }, "Get i2c gpio 1 state");
   cli_exec.add_command("get-i2c-gpio1", [](){return unsigned(app->get_i2c_gpio1().get()); }, "Get i2c gpio 1 inputs");
   cli_exec.add_command("taskinfo", taskinfo, "Dump status of specified task");
+  cli_exec.add_command("mainstack", [](){ return uxTaskGetStackHighWaterMark(xTaskGetCurrentTaskHandle()); }, "High water mark of main stack");
+  cli_exec.add_command("heap", [](){ return ESP.getFreeHeap(); }, "Free heap");
   cli_exec.add_command("log", [](unsigned level){lg::LogStream::Instance().set_log_level(level); return level; }, "Set log level, 0-5");
 
   netw = new Netw("gatectl", [](bool connected) {
@@ -431,7 +526,24 @@ void setup() {
     // Mind the stack!
     mqtt->send("response", cli_exec(payload));
   });
-  netw->start();
+  mqtt->subscribe("prog/begin", [](std::string topic, std::string payload) {
+    if (Update.begin()) {
+      mqtt->send("prog/begin/ack", "");
+    } else {
+      mqtt->send("prog/begin/nack", "");
+    }
+  });
+  mqtt->subscribe("prog/write", [](std::string topic, std::string payload) {
+    if (Update.write(reinterpret_cast<uint8_t *>(const_cast<char *>(payload.c_str())), payload.size() )) {
+      mqtt->send("prog/write/ack", std::to_string(payload.size()));
+    } else {
+      mqtt->send("prog/write/nack", "");
+    }
+  });
+
+  app->set_telem_sender([](std::string const & s){ mqtt->send("status", s); });
+//  netw->start();
+  netw->setup_net();
 }
 
 void loop()

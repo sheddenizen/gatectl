@@ -41,6 +41,7 @@ class PCF8574Gpio {
       set(val ? _last_set | mask : _last_set & ~mask);
     }
     uint8_t last_set() const { return _last_set; }
+    uint8_t last_get() const { return _last_raw; }
     char const * name() const { return _name; }
   private:
     char const * const _name;
@@ -51,7 +52,7 @@ class PCF8574Gpio {
 };
 
 std::ostream & operator << (std::ostream & os, PCF8574Gpio const & gpio) {
-  os << gpio.name() << "=0x" << std::hex << unsigned(gpio.get()) << "/0x" << std::hex << unsigned(gpio.last_set());
+  os << gpio.name() << "=0x" << std::hex << unsigned(gpio.last_get()) << "/0x" << std::hex << unsigned(gpio.last_set());
   return os;
 }
 
