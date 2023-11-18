@@ -72,7 +72,7 @@ void Netw::poll()
     wl_status_t _wifi_state = WiFi.status();
 
     if (_wifi_state != _wifi_last) {
-      lg::I() << "Wifi state change: " << _wifi_state << " (was "  << _wifi_last << ")" << " ssid: " << WiFi.SSID();
+      lg::I() << "Wifi state change: " << _wifi_state << " (was "  << _wifi_last << ")" << " ssid: " << WiFi.SSID().c_str();
       _wifi_last = _wifi_state;
     } else {
           vTaskDelay(_delayms / portTICK_PERIOD_MS);

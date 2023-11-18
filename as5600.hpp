@@ -38,7 +38,10 @@ class AS5600PosnSensor {
     uint16_t operator()() { return (raw() + _offset) & mask; }
     uint16_t degr(uint16_t raw_val) const 
     { return ((raw_val + _offset) & mask) * 360 / (1 << resbits); }
-    uint16_t degr() { return degr(raw()); }
+    uint16_t degr() { return mrad(raw()); }
+    uint16_t mrad(uint16_t raw_val) const 
+    { return ((raw_val + _offset) & mask) * 100531 / (1 << (resbits+4)); }
+    uint16_t mrad() { return mrad(raw()); }
     uint16_t last_raw() const { return _last_raw; }
     char const * name() const { return _name; }
     bool error() const { return _error; }
@@ -53,7 +56,7 @@ class AS5600PosnSensor {
 
 std::ostream & operator << (std::ostream & os, AS5600PosnSensor const & sens) {
   uint16_t raw=sens.last_raw();
-  os << sens.name() << '=' << sens.degr(raw) << "deg(" << raw << ')';
+  os << sens.name() << '=' << sens.mrad(raw) << "mRadn(" << raw << ')';
   return os;
 }
 

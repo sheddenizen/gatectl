@@ -53,7 +53,7 @@ class PCF8574Gpio {
 
 std::ostream & operator << (std::ostream & os, PCF8574Gpio const & gpio) {
   os << gpio.name() << "=0x" << std::hex << unsigned(gpio.last_get()) << "/0x" << std::hex << unsigned(gpio.last_set());
-  return os;
+  return os << std::dec;
 }
 
 #endif // PCF8574_HPP

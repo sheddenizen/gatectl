@@ -7,13 +7,13 @@
 
 class AnalogIn {
   public:
-    AnalogIn(char const * name, char const * units, uint8_t pin, int16_t cal1raw, int cal1val, int16_t cal2raw, int cal2val)
+    AnalogIn(char const * name, char const * units, uint8_t pin, int16_t cal1raw, int cal1val, int16_t cal2raw, int cal2val, adc_attenuation_t atten = ADC_0db)
       : _name(name), _units(units), _pin(pin)
       ,  _num(cal2val - cal1val)
       ,  _div(cal2raw - cal1raw)
-      ,  _offs(-cal1raw * _num / _div -cal1val)
+      ,  _offs(cal1val - cal1raw * _num / _div)
     {
-      analogSetPinAttenuation(pin, ADC_0db);
+      analogSetPinAttenuation(pin, atten);
     }
 
     int raw() const { return analogRead(_pin); }
