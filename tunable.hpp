@@ -27,6 +27,15 @@ class Item
         register_cmds(name, *our_cli_exec());
       }
     }
+    struct ILType { char const * name; T default_value; };
+    Item(std::initializer_list<ILType>il)
+      : _default(il.default_value)
+      , _value(il.default_value)
+    {
+      if (our_cli_exec()) {
+        register_cmds(il.name, *our_cli_exec());
+      }
+    }
     void register_cmds(std::string const & name, cli::Executor & cli_exec)
     {
       cli_exec.add_command(std::string("set-") + name, [this](T value){return this->set(value);}, std::string("Set ") + name + " tunable to value (default value: " + std::to_string(_default) + ")" );

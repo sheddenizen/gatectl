@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <utility>
 #include <functional>
+#include <unordered_map>
 
 #include "cal_data.hpp"
 
@@ -59,8 +60,95 @@ std::ostream & operator<<(std::ostream & os, SrvPulseOut const & spo) {
   return os << spo.name() << '=' << spo.get_last_pos() << spo.units() << '(' << spo.raw() << ')';
 }
 
+template<typename A>
+struct StateMachine {
+    struct Event { char const * name; };
+    struct State { char const * name; };
+    using STKey = std::pair<Event, State>;
+    using ActionFn = void (A::*)();
+    using STVal = std::pair<ActionFn, State>;
+    struct STKeyHash {
+      // Hash derived from the address of name strings, not the state/event objects
+      std::size_t operator()(STKey const &k) const { return std::hash<char const *>()(k.first.name) + (std::hash<char const *>()(k.second.name) << 1); }
+    };
+    struct STKeyEq {
+      bool operator()(STKey const & a, STKey const & b) const { return a.first.name == b.first.name && a.second.name == b.second.name; }
+    };
+    using StateTable = std::unordered_map<STKey, STVal, STKeyHash, STKeyEq>;
+    A & _app;
+    StateTable _state_table;
+    State _current_state;
+    void handle_event(Event e) {
+      auto it = _state_table.find({ e, _current_state });
+      if (it == _state_table.end()) {
+        return;
+      }
+      lg::I() << "Got " << e.name << " event in state " << _current_state.name << ", moving to " << it->second.second.name;
+      _current_state = it->second.second;
+      // Calls to action function may recurse
+      (_app.*it->second.first)();
+    }
+    void handle_event_by_name(std::string const & name) {
+      for (auto & ref : _state_table) {
+        if (ref.first.first.name == name) {
+          handle_event(ref.first.first);
+          break;
+        }
+      }
+    }
+};
+
 class App {
-    std::map<std::pair<char const *, char const *>, std::pair<char const *, char const *>> _state_table;
+    struct Btn {
+      enum {
+        open = 1 << 7,
+        close = 1 << 6,
+        stop = 1 << 4
+      };
+    };
+
+    using sm = StateMachine<App>;
+    struct {
+      sm::Event const gobuttonpush = { "gobuttonpush" };
+      sm::Event const stopbuttonpush = { "stopbuttonpush" };
+      sm::Event const hardwareerror = { "hardwareerror" };
+      sm::Event const unlatched = { "unlatched" };
+      sm::Event const atdecelpoint = { "atdecelpoint" };
+      sm::Event const atlatchpoint = { "atdecelpoint" };
+      sm::Event const latched = { "latched" };
+      sm::Event const timeout = { "timeout" };
+      sm::Event const noretries = { "noretries" };
+    } const ev;
+    struct {
+      sm::State const free = { "free" };
+      sm::State const unlatching = { "unlatching" };
+      sm::State const moving = { "moving" };
+      sm::State const decelerating = { "decelerating" };
+      sm::State const latching = { "latching" };
+      sm::State const docked = { "docked" };
+    } const st;
+    sm _appsm = {*this, {
+      { {ev.gobuttonpush, st.free},         { &App::liftlatch, st.unlatching} },
+      { {ev.gobuttonpush, st.docked},       { &App::liftlatch, st.unlatching} },
+      { {ev.unlatched, st.unlatching},      { &App::startmoving, st.moving} },
+      { {ev.atdecelpoint, st.moving},       { &App::decelerate, st.decelerating} },
+      { {ev.atlatchpoint, st.decelerating}, { &App::droplatch, st.latching} },
+      { {ev.latched, st.decelerating},      { &App::finish, st.free} },
+    }, st.free };
+
+    struct Target {
+      // Point at which we drop the latch and beyond which we check for successful docking
+      tunable::Item<int16_t> latch_threshold_mrad;
+      // Linear velocity, mm/s, that we approach the dock at
+      tunable::Item<int16_t> docking_velocity;
+      // Linear velocity, mm/s, that we limit ourselves to for the main swing 
+      tunable::Item<int16_t> move_velocity;
+      // Name of the target
+      char const * name;
+      uint8_t const btn_go_msk;
+      uint8_t const btn_stop_msk;
+      bool const posdir;
+    };
   public:
     App()
       : _i2cgpio1("RemoteGpio", Wire, 0)
@@ -69,13 +157,6 @@ class App {
       , _latch_pos("Latch", "mm", 32, 2580, 13, 1584, 44, ADC_6db)
       , _latch_lift("LatchLift", "mm", 19, 1250, 13, 1750, 44, 8)
       , _mctl(_batt_mv)
-      , _close_pos("Closed Threshold, mrad", 4712)
-      , _open_pos("Open Threshold, mrad", 1570)
-      , _close_vel("Close docking velocity, mm/s", 500)
-      , _open_vel("Open docking velocity, mm/s", 1000)
-      , _latch_lifted_pos("Latch lift threshold mm", 40)
-      , _latch_secure_pos("Latch secure threshold, mm", 10)
-      , _latch_drive_margin("Overdrive latch margin, mm", 5)
       {
         start_control_task();
       }
@@ -85,11 +166,71 @@ class App {
     MotorControl const & get_motor_control() const { return _mctl; }
     void latch_go(int32_t pos) { _latch_lift.go(pos); }
     void latch_stop() { _latch_lift.stop(); }
+
+    // Action functions
+    void liftlatch() {}
+    void startmoving() {}
+    void decelerate() {}
+    void droplatch() {}
+    void finish() {}
+
+
   private:
+    void control_task()
+    {
+      constexpr int intervalms = 10;
+      unsigned count = 0;
+      uint8_t last_ctl_in = 0x0f;
+      vTaskDelay(2000 / portTICK_PERIOD_MS);
+      lg::I() << "Start control loop";
+
+      unsigned long tms = millis();
+      unsigned long ttarg = tms - tms % intervalms;
+ 
+      for (;;) {
+        ttarg += intervalms;
+        tms = millis();
+        int sleept = int(ttarg - tms);
+        if (sleept < -intervalms || sleept > intervalms) {
+          lg::E() << "Control loop time correction, target: " << ttarg << ", now: " << tms;
+          ttarg = tms - tms % intervalms + intervalms;
+          sleept = int(ttarg - tms);
+        }
+        if (sleept < 0)
+          sleept = 0;
+        vTaskDelay(sleept / portTICK_PERIOD_MS);
+        tms = millis();
+        ++count;
+        uint8_t ctl_in = _i2cgpio1.get();
+        uint8_t ctl_new = (~last_ctl_in & ctl_in);
+        last_ctl_in = ctl_in;
+
+        if (_target && (ctl_new & _target->btn_stop_msk))
+          _appsm.handle_event(ev.stopbuttonpush);
+        if (!_target && (ctl_new & (Btn::close | Btn::close)))
+            _target = (ctl_new & Btn::close) ? &_close_target : &_open_target;
+        if (ctl_new & _target->btn_go_msk)
+          _appsm.handle_event(ev.gobuttonpush);
+
+        int16_t drive_angle = _drive_angle.mrad();
+        if (_target) {
+          if ((drive_angle > _target->latch_threshold_mrad) == _target->posdir)
+            _appsm.handle_event(ev.atlatchpoint);
+          if ((drive_angle > _target->latch_threshold_mrad) == _target->posdir)
+            _appsm.handle_event(ev.atlatchpoint);
+        }
+
+        if (count % (_mctl.running() ? 50 : 500) == 0) {
+          collect_and_send_stats();
+        }
+
+      }
+    }
+
     static constexpr bool open_btn(uint8_t x) { return (x & 1<<7) != 0; }
     static constexpr bool close_btn(uint8_t x) { return (x & 1<<6) != 0; }
     static constexpr bool stop_btn(uint8_t x) { return (x & 1<<4) != 0; }
-    void control_task()
+    void old_control_task()
     {
       constexpr int intervalms = 10;
       int torq_target = 0;
@@ -136,7 +277,7 @@ class App {
         if (ctl_new)
           _mctl.set_torque(torq_target);
 
-        int16_t drive_angle = _drive_angle();
+        /* int16_t drive_angle = */ _drive_angle();
 
         if (_drive_angle.error() || _mctl.error()) {
           if (error_count == 0)
@@ -148,25 +289,7 @@ class App {
         }
 
         if (count % (_mctl.running() ? 50 : 500) == 0) {
-          _mctl.reset_stats();
-          auto s = _mctl.get_last_stats();
-          std::ostringstream os;
-          os << "{\"run\":" << _mctl.running()
-             << ",\"dr_a\":" << drive_angle
-             << ",\"Vb_mV\":" << _batt_mv()
-             << ",\"Tup_ms\":" << tms
-             << ",\"N\":" << count;
-          if (_mctl.running()) {
-            os << ",\"f_Hz\":" << s.rate
-              << ",\"sp_Hz\":" << s.speed
-              << ",\"Ia_mA\":" << s.mot_i_a
-              << ",\"Ib_mA\":" << s.mot_i_b
-              << ",\"Vd_mV\":" << s.drive
-              << ",\"Ta_Nm\":" << s.torque 
-              << ",\"Tt_Nm\":" << torq_target;
-          }
-          os << "}";
-          _telem_send_fn(os.str());
+          collect_and_send_stats();
         }
       }
     }
@@ -175,8 +298,28 @@ class App {
       lg::I() << "Start Control Task";
       xTaskCreatePinnedToCore([](void *app){ (*(App*)app).control_task(); }, "control_task", 15000, this, 0, &_ctrl_task, 0);
     }
-    PCF8574Gpio _i2cgpio1;
-    
+    void collect_and_send_stats() {
+          _mctl.reset_stats();
+          auto s = _mctl.get_last_stats();
+          std::ostringstream os;
+          os << "{\"run\":" << _mctl.running()
+             << ",\"dr_a\":" << _drive_angle.mrad(_drive_angle.last_raw())
+             << ",\"Vb_mV\":" << _batt_mv()
+             /* << ",\"Tup_ms\":" << tms
+             << ",\"N\":" << count */;
+          if (_mctl.running()) {
+            os << ",\"f_Hz\":" << s.rate
+              << ",\"sp_Hz\":" << s.speed
+              << ",\"Ia_mA\":" << s.mot_i_a
+              << ",\"Ib_mA\":" << s.mot_i_b
+              << ",\"Vd_mV\":" << s.drive
+              << ",\"Ta_Nm\":" << s.torque
+              /* << ",\"Tt_Nm\":" << torq_target */;
+          }
+          os << "}";
+          _telem_send_fn(os.str());
+    }
+    PCF8574Gpio _i2cgpio1;    
     AS5600PosnSensor _drive_angle;
     AnalogIn _batt_mv;
     AnalogIn _latch_pos;
@@ -185,13 +328,12 @@ class App {
     MotorControl _mctl;
     std::function<void(std::string const &)> _telem_send_fn;
     friend std::ostream & operator << (std::ostream & os, App const & app);
-    tunable::Item<uint16_t> _close_pos;
-    tunable::Item<uint16_t> _open_pos;
-    tunable::Item<uint16_t> _close_vel;
-    tunable::Item<uint16_t> _open_vel;
-    tunable::Item<uint16_t> _latch_lifted_pos;
-    tunable::Item<uint16_t> _latch_secure_pos;
-    tunable::Item<uint16_t> _latch_drive_margin;
+    tunable::Item<uint16_t> _latch_lifted_pos = {"Latch lift threshold mm", 40};
+    tunable::Item<uint16_t> _latch_secure_pos = {"Latch secure threshold, mm", 10};
+    tunable::Item<uint16_t> _latch_drive_margin = {"Overdrive latch margin, mm", 5};
+    Target const * _target = 0;
+    Target _open_target = {{"Open threshold, mrad", 1570}, {"Open docking velocity, mm/s", 700}, {"Opening velocity, mm/s", 1500}, "open", Btn::close, Btn::open | Btn::stop, false };
+    Target _close_target = {{"Close threshold, mrad", 4712}, {"Close docking velocity, mm/s", 700}, {"Closing velocity, mm/s", 1500}, "close", Btn::open, Btn::close | Btn::stop, true };
 };
 
 std::ostream & operator << (std::ostream & os, App const & app) {
