@@ -83,7 +83,11 @@ struct StateMachine {
       if (it == _state_table.end()) {
         return;
       }
-      lg::I() << "Got " << e.name << " event in state " << _current_state.name << ", moving to " << it->second.second.name;
+      if (_current_state.name != it->second.second.name)
+        lg::I() << "Got " << e.name << " event in state " << _current_state.name << ", moving to " << it->second.second.name;
+      else
+        lg::D() << "Got " << e.name << " event in state " << _current_state.name << ", no change";
+
       _current_state = it->second.second;
       // Calls to action function may recurse
       (_app.*it->second.first)();
@@ -96,6 +100,7 @@ struct StateMachine {
         }
       }
     }
+    char const * current_state_name() const { return _current_state.name; }
 };
 
 class App {
@@ -113,8 +118,10 @@ class App {
       sm::Event const stopbuttonpush = { "stopbuttonpush" };
       sm::Event const hardwareerror = { "hardwareerror" };
       sm::Event const unlatched = { "unlatched" };
-      sm::Event const atdecelpoint = { "atdecelpoint" };
-      sm::Event const atlatchpoint = { "atdecelpoint" };
+      sm::Event const inmainswing = { "inmainswing" };
+      sm::Event const indockingrange = { "indockingrange" };
+      sm::Event const inlatchingrange = { "inlatchingrange" };
+      sm::Event const manuallatch = { "manuallatch" };
       sm::Event const latched = { "latched" };
       sm::Event const timeout = { "timeout" };
       sm::Event const noretries = { "noretries" };
@@ -123,20 +130,24 @@ class App {
       sm::State const free = { "free" };
       sm::State const unlatching = { "unlatching" };
       sm::State const moving = { "moving" };
-      sm::State const decelerating = { "decelerating" };
+      sm::State const docking = { "docking" };
       sm::State const latching = { "latching" };
       sm::State const docked = { "docked" };
+      sm::State const backup = { "backup" };
     } const st;
     sm _appsm = {*this, {
       { {ev.gobuttonpush, st.free},         { &App::liftlatch, st.unlatching} },
       { {ev.gobuttonpush, st.docked},       { &App::liftlatch, st.unlatching} },
       { {ev.unlatched, st.unlatching},      { &App::startmoving, st.moving} },
-      { {ev.atdecelpoint, st.moving},       { &App::decelerate, st.decelerating} },
-      { {ev.atlatchpoint, st.decelerating}, { &App::droplatch, st.latching} },
-      { {ev.latched, st.decelerating},      { &App::finish, st.free} },
+      { {ev.indockingrange, st.moving},     { &App::decelerate, st.docking} },
+      { {ev.inlatchingrange, st.docking},   { &App::droplatch, st.latching} },
+      { {ev.latched, st.latching},          { &App::finish, st.docked} },
+      { {ev.manuallatch, st.free},          { &App::finish, st.docked} },
+      { {ev.inmainswing, st.docked},     { &App::befree, st.free} },
     }, st.free };
 
     struct Target {
+      Target const * const opposite;
       // Point at which we drop the latch and beyond which we check for successful docking
       tunable::Item<int16_t> latch_threshold_mrad;
       // Linear velocity, mm/s, that we approach the dock at
@@ -152,11 +163,12 @@ class App {
   public:
     App()
       : _i2cgpio1("RemoteGpio", Wire, 0)
-      , _drive_angle("Drive", Wire, -1260)
+      , _drive_angle("Drive", Wire, 800)
       , _batt_mv("Battery", "mV", 39, 0, 0, 2675, 12140)
       , _latch_pos("Latch", "mm", 32, 2580, 13, 1584, 44, ADC_6db)
       , _latch_lift("LatchLift", "mm", 19, 1250, 13, 1750, 44, 8)
       , _mctl(_batt_mv)
+      , _vel_filter(10,8000)
       {
         start_control_task();
       }
@@ -168,13 +180,42 @@ class App {
     void latch_stop() { _latch_lift.stop(); }
 
     // Action functions
-    void liftlatch() {}
-    void startmoving() {}
-    void decelerate() {}
-    void droplatch() {}
-    void finish() {}
+    void liftlatch() {
+      _latch_target = _latch_lifted_pos + _latch_drive_margin;
+      _docked_target = 0;
+    }
+    void startmoving() {
+      _torq_target = 0;
+      _velocity_target = _target->move_velocity * (_target->posdir ? 1 : -1);
+      _mctl.run();
+      _mctl.set_torque(_torq_target);
+    }
+    void decelerate() {
+      _velocity_target = _target->docking_velocity * (_target->posdir ? 1 : -1);
+    }
+    void droplatch() {
+      _latch_target = _latch_secure_pos - _latch_drive_margin;
+      _velocity_target = 0;
+    }
+    void finish() {
+      _mctl.stop();
+      _docked_target = _target;
+      if (_target)
+        _target = _target->opposite;
+      else
+        lg::E() << "NULL Target at finish!";
 
+    }
+    void befree() {
+      _mctl.stop();
+      lg::D() << "befree: Clearing target";
+      _target = 0;
+      _docked_target = 0;
+      _latch_target = _latch_secure_pos - _latch_drive_margin;
+      _velocity_target = 0;
+    }
 
+    void donothing() {}
   private:
     void control_task()
     {
@@ -186,6 +227,10 @@ class App {
 
       unsigned long tms = millis();
       unsigned long ttarg = tms - tms % intervalms;
+      int16_t last_drive_angle = _drive_angle.mrad();
+
+      // Start latch in the latch positon
+      _latch_target = _latch_secure_pos - _latch_drive_margin;
  
       for (;;) {
         ttarg += intervalms;
@@ -207,18 +252,81 @@ class App {
 
         if (_target && (ctl_new & _target->btn_stop_msk))
           _appsm.handle_event(ev.stopbuttonpush);
-        if (!_target && (ctl_new & (Btn::close | Btn::close)))
-            _target = (ctl_new & Btn::close) ? &_close_target : &_open_target;
-        if (ctl_new & _target->btn_go_msk)
-          _appsm.handle_event(ev.gobuttonpush);
 
         int16_t drive_angle = _drive_angle.mrad();
+        _latch_actual = _latch_pos();
+
+        if (!_target) {
+          if (ctl_new & _open_target.btn_go_msk)
+              _target = &_open_target;
+          if (ctl_new & _close_target.btn_go_msk)
+              _target = &_close_target;
+          if (_target) {
+              lg::I() << "GO Button push: Setting target to " << _target->name;
+              _appsm.handle_event(ev.gobuttonpush);
+          }
+        } else if (ctl_new & _target->btn_go_msk) {
+          _appsm.handle_event(ev.gobuttonpush);
+        }
+
+        if (!_target && (_latch_actual < _latch_secure_pos)) {
+          Target * docktarg = 0;
+          if ((drive_angle > _open_target.latch_threshold_mrad) == _open_target.posdir)
+            docktarg = &_open_target;
+          if ((drive_angle > _close_target.latch_threshold_mrad) == _close_target.posdir)
+            docktarg = &_close_target;
+          if (docktarg) {
+            lg::I() << "Manual latch: Setting target to " << docktarg->name;
+            _target = docktarg;
+            _appsm.handle_event(ev.manuallatch);
+          }
+        }
+
+        // Do we know where we're going?
         if (_target) {
-          if ((drive_angle > _target->latch_threshold_mrad) == _target->posdir)
-            _appsm.handle_event(ev.atlatchpoint);
-          if ((drive_angle > _target->latch_threshold_mrad) == _target->posdir)
-            _appsm.handle_event(ev.atlatchpoint);
+          // Work out where in the swing we are and send event (repeatedly)
+          if ((drive_angle > _target->latch_threshold_mrad) == _target->posdir) {
+            _appsm.handle_event(ev.inlatchingrange);
+          } else {
+            const int docking_mrad = _target->latch_threshold_mrad + int32_t(_docking_range) * (_target->posdir ? -1000 : 1000) / int32_t(_gate_radius);
+            if ((drive_angle > docking_mrad) == _target->posdir)
+              _appsm.handle_event(ev.indockingrange);
+            else if ((drive_angle > _target->opposite->latch_threshold_mrad) != _target->opposite->posdir)
+              // Only if not in latching range of the other end
+              _appsm.handle_event(ev.inmainswing);
+          }
         }
+        // delta in mRad/1000 * radius in mm * 1000mms/interval in ms / 2 (linkage) -> velocity mm/s
+        int da_delta = int(drive_angle - last_drive_angle) * int(_gate_radius) / intervalms / 2;
+        last_drive_angle = drive_angle;
+        _velocity_actual = _vel_filter(da_delta);
+
+        int vel_error =  _velocity_target - _velocity_actual;
+
+        if (vel_error > 20)
+          _torq_target += _delta_torque * intervalms / 1000;
+          if (_torq_target > _move_torque)
+            _torq_target = _move_torque;
+
+        if (vel_error < 20)
+          _torq_target -= _delta_torque * intervalms / 1000;
+          if (_torq_target <  -_move_torque)
+            _torq_target = - _move_torque;
+
+        // Motor control is negative wrt drive shaft because gears
+        _mctl.set_torque(-_torq_target);
+
+        if (_latch_actual < _latch_secure_pos)
+          _appsm.handle_event(ev.latched);
+        if (_latch_actual > _latch_lifted_pos)
+          _appsm.handle_event(ev.unlatched);
+
+        // Slow lift, fast drop
+        if (_latch_target > _latch_lift.get_last_pos() && count % 4 == 0)
+          _latch_lift.go(_latch_lift.get_last_pos() + 1);
+        if (_latch_target < _latch_lift.get_last_pos())
+          _latch_lift.go(_latch_target);
+
 
         if (count % (_mctl.running() ? 50 : 500) == 0) {
           collect_and_send_stats();
@@ -227,72 +335,6 @@ class App {
       }
     }
 
-    static constexpr bool open_btn(uint8_t x) { return (x & 1<<7) != 0; }
-    static constexpr bool close_btn(uint8_t x) { return (x & 1<<6) != 0; }
-    static constexpr bool stop_btn(uint8_t x) { return (x & 1<<4) != 0; }
-    void old_control_task()
-    {
-      constexpr int intervalms = 10;
-      int torq_target = 0;
-      unsigned count = 0;
-      uint8_t last_ctl_in = 0x0f;
-      vTaskDelay(2000 / portTICK_PERIOD_MS);
-      lg::I() << "Start control loop";
-      unsigned long tms = millis();
-      unsigned long ttarg = tms - tms % intervalms;
-      unsigned error_count = 0;
- 
-      for (;;) {
-        ttarg += intervalms;
-        tms = millis();
-        int sleept = int(ttarg - tms);
-        if (sleept < -intervalms || sleept > intervalms) {
-          lg::E() << "Control loop time correction, target: " << ttarg << ", now: " << tms;
-          ttarg = tms - tms % intervalms + intervalms;
-          sleept = int(ttarg - tms);
-        }
-        if (sleept < 0)
-          sleept = 0;
-        vTaskDelay(sleept / portTICK_PERIOD_MS);
-        tms = millis();
-        ++count;
-        uint8_t ctl_in = _i2cgpio1.get();
-        uint8_t ctl_new = (~last_ctl_in & ctl_in);
-        last_ctl_in = ctl_in;
-        if (open_btn(ctl_new)) {
-          lg::I() << "Open Btn " << _i2cgpio1;
-          torq_target -= 5000;
-          _mctl.run();
-        }
-        if (close_btn(ctl_new)) {
-          torq_target += 5000;
-          lg::I() << "Close Btn " << _i2cgpio1;
-          _mctl.run();
-        }
-        if (stop_btn(ctl_new)) {
-          torq_target = 0;
-          lg::I() << "STOP Btn " << _i2cgpio1;
-          _mctl.stop();
-        }
-        if (ctl_new)
-          _mctl.set_torque(torq_target);
-
-        /* int16_t drive_angle = */ _drive_angle();
-
-        if (_drive_angle.error() || _mctl.error()) {
-          if (error_count == 0)
-            lg::E() << "Sensor Error, Drive: " << _drive_angle.error() << " Motor Ctl: " << _mctl.error();
-          error_count++;
-        } else if (error_count) {
-          lg::W() << "Sensor Error cleared at error count: " << error_count;
-          error_count = 0;
-        }
-
-        if (count % (_mctl.running() ? 50 : 500) == 0) {
-          collect_and_send_stats();
-        }
-      }
-    }
     void start_control_task()
     {
       lg::I() << "Start Control Task";
@@ -303,8 +345,11 @@ class App {
           auto s = _mctl.get_last_stats();
           std::ostringstream os;
           os << "{\"run\":" << _mctl.running()
-             << ",\"dr_a\":" << _drive_angle.mrad(_drive_angle.last_raw())
+             << ",\"dra_mrad\":" << _drive_angle.mrad(_drive_angle.last_raw())
+             << ",\"Vdact_mmps\":" << _velocity_actual
+             << ",\"Vdtrg_mmps\":" << _velocity_target
              << ",\"Vb_mV\":" << _batt_mv()
+             << ",\"Plat_mm\":" << _latch_actual;
              /* << ",\"Tup_ms\":" << tms
              << ",\"N\":" << count */;
           if (_mctl.running()) {
@@ -326,18 +371,41 @@ class App {
     SrvPulseOut _latch_lift;
     TaskHandle_t _ctrl_task =0;
     MotorControl _mctl;
+    LpFilter _vel_filter;
     std::function<void(std::string const &)> _telem_send_fn;
     friend std::ostream & operator << (std::ostream & os, App const & app);
-    tunable::Item<uint16_t> _latch_lifted_pos = {"Latch lift threshold mm", 40};
-    tunable::Item<uint16_t> _latch_secure_pos = {"Latch secure threshold, mm", 10};
-    tunable::Item<uint16_t> _latch_drive_margin = {"Overdrive latch margin, mm", 5};
+    tunable::Item<uint16_t> _latch_lifted_pos = {"latch-lift-thres-mm", 30};
+    tunable::Item<uint16_t> _latch_secure_pos = {"latch-secure-thres-mm", 10};
+    tunable::Item<uint16_t> _latch_drive_margin = {"latch-overdrive-mm", 5};
+    tunable::Item<uint16_t> _move_torque = {"drv-torque", 3000};
+    tunable::Item<uint16_t> _delta_torque = {"delta-torque", 1000};
+    int16_t _latch_target = 0;
+    int16_t _latch_actual = 0;
+    tunable::Item<uint16_t> _docking_range = {"dock-range-mm", 500};
+    tunable::Item<uint16_t> _gate_radius = {"gate-radius-mm", 2850};
     Target const * _target = 0;
-    Target _open_target = {{"Open threshold, mrad", 1570}, {"Open docking velocity, mm/s", 700}, {"Opening velocity, mm/s", 1500}, "open", Btn::close, Btn::open | Btn::stop, false };
-    Target _close_target = {{"Close threshold, mrad", 4712}, {"Close docking velocity, mm/s", 700}, {"Closing velocity, mm/s", 1500}, "close", Btn::open, Btn::close | Btn::stop, true };
+    Target const * _docked_target = 0;
+    Target _open_target = {&_close_target, {"op-thres-mrad", 1630}, {"op-vdock-mmps", 100}, {"op-v-mmps", 200}, "open", Btn::open, Btn::open | Btn::stop, false };
+    Target _close_target = {&_open_target, {"cl-thres-mrad", 4667}, {"cl-vdock-mmps", 100}, {"cl-v-mmps", 200}, "close", Btn::close, Btn::close | Btn::stop, true };
+    int16_t _velocity_target = 0;
+    int16_t _velocity_actual = 0;
+    int16_t _torq_target = 0;
+
 };
 
 std::ostream & operator << (std::ostream & os, App const & app) {
-  os << "Drive=" << app._drive_angle << ' ' 
+  os << "State=" << app._appsm.current_state_name() << " ";
+  
+  if (app._target) {
+    os << " Tgt="
+      << app._target->name 
+      << "(Dt=" << app._target->latch_threshold_mrad 
+      << ",Vt=" << app._velocity_target
+      << ",Tt=" << app._torq_target << ") ";
+  }
+
+  os << app._drive_angle << ' '
+     << "vdrive=" << app._velocity_actual << "mm/s "
      << app._i2cgpio1 << ' '
      << app._latch_pos << ' '
      << app._latch_lift << ' '
@@ -443,7 +511,7 @@ static Mqtt * mqtt;
 
 static void print_state() {
   netw->poll();
-  lg::I() << (*app) << " Wifi: " << netw;
+  lg::I() << (*app) << " Wifi: " << *netw;
   lg::LogStream::Instance().print();
 }
 

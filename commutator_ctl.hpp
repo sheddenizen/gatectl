@@ -75,7 +75,7 @@ class CommutatorCtl {
     unsigned _last_pos = 0;
     unsigned _last_phase_pos = 0;
     int _last_phase_advance = 0;
-    tunable::Item<int> _base_phase_advance;
+    tunable::Item<int16_t> _base_phase_advance;
     int _drive_phase;
     unsigned _recover_count = 0;
     unsigned _supply_filt = 0;

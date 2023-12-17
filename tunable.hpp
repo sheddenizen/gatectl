@@ -1,3 +1,4 @@
+#include <functional>
 #ifndef TUNABLE_HPP
 #define TUNABLE_HPP
 
@@ -12,32 +13,34 @@ template<typename T>
 class Item
 {
   public:
-    Item(std::string const & name, T default_value, cli::Executor &cli_exec)
+    Item(std::string name, T default_value)
       : _default(default_value)
       , _value(default_value)
     {
-      our_cli_exec() = &cli_exec;
-      register_cmds(name, cli_exec);
+      // I have backed myself into a corner
+      char * n = (char *)malloc(name.size() + 1);
+      strcpy(n, name.c_str());
+      _name = n;
+      deferred_register();
     }
-    Item(std::string const & name, T default_value)
+    Item(char const * name, T default_value)
       : _default(default_value)
       , _value(default_value)
+      , _name(name)
     {
-      if (our_cli_exec()) {
-        register_cmds(name, *our_cli_exec());
-      }
+      deferred_register();
     }
     struct ILType { char const * name; T default_value; };
     Item(std::initializer_list<ILType>il)
       : _default(il.default_value)
       , _value(il.default_value)
+      , _name(il.name)
     {
-      if (our_cli_exec()) {
-        register_cmds(il.name, *our_cli_exec());
-      }
+      deferred_register();
     }
-    void register_cmds(std::string const & name, cli::Executor & cli_exec)
+    void register_cmds(cli::Executor & cli_exec)
     {
+      std::string name(_name);
       cli_exec.add_command(std::string("set-") + name, [this](T value){return this->set(value);}, std::string("Set ") + name + " tunable to value (default value: " + std::to_string(_default) + ")" );
       cli_exec.add_command(std::string("get-") + name, [this](){return (*this)();}, std::string("Get ") + name + " tunable current value" );
     }
@@ -48,19 +51,40 @@ class Item
   private:
     T const _default;
     T _value;
-    Item():_default(0){}
+    char const * _name;
+    Item(cli::Executor * cli_exec):_default(0), _name(0)
+    {
+      our_cli_exec() = cli_exec;
+    }
     cli::Executor * & our_cli_exec()
     {
       // Nasty, but convenient
       static cli::Executor * cli_exec;
       return cli_exec;
     }
+    void deferred_register()
+    {
+      static std::function<void()> regchain;
+      std::function<void()> rc_copy = regchain;
+      auto df = [this, rc_copy]() {
+        register_cmds(*our_cli_exec());
+        if (rc_copy)
+          rc_copy();
+      };
+      if (_name)
+        regchain = df;
+      if (our_cli_exec() && regchain) {
+        regchain();
+        regchain = std::function<void()>();
+      }
+    }
     friend void set_cli_executor(cli::Executor & cli_exec);
 };
 
 inline void set_cli_executor(cli::Executor & cli_exec)
 {
-  Item<int>().our_cli_exec() = &cli_exec;
+  // ToDo: this wonderful mechanism only works if every T is int16_t
+  Item<int16_t>(&cli_exec).deferred_register();
 }
 
 } // tunable
