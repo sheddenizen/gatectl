@@ -129,21 +129,47 @@ class App {
     struct {
       sm::State const free = { "free" };
       sm::State const unlatching = { "unlatching" };
+      sm::State const unlatched = { "unlatched" };
       sm::State const moving = { "moving" };
       sm::State const docking = { "docking" };
       sm::State const latching = { "latching" };
       sm::State const docked = { "docked" };
-      sm::State const backup = { "backup" };
+      sm::State const goback = { "goback" };
     } const st;
     sm _appsm = {*this, {
-      { {ev.gobuttonpush, st.free},         { &App::liftlatch, st.unlatching} },
-      { {ev.gobuttonpush, st.docked},       { &App::liftlatch, st.unlatching} },
-      { {ev.unlatched, st.unlatching},      { &App::startmoving, st.moving} },
-      { {ev.indockingrange, st.moving},     { &App::decelerate, st.docking} },
+      { {ev.gobuttonpush, st.free},         { &App::goliftlatch, st.unlatching} },
+      { {ev.gobuttonpush, st.docked},       { &App::goliftlatch, st.unlatching} },
+      { {ev.timeout, st.unlatching},        { &App::befree, st.free} },
+      { {ev.unlatched, st.unlatching},      { &App::preparemove, st.unlatched} },
+      { {ev.noretries, st.unlatching},      { &App::befree, st.free} },
+
+      { {ev.inmainswing, st.unlatched},     { &App::startmainswing, st.moving} },
+      { {ev.timeout, st.unlatched},         { &App::startmainswing, st.moving} },
+      { {ev.indockingrange, st.unlatched},  { &App::goback, st.goback} },
+      { {ev.inlatchingrange, st.unlatched}, { &App::goback, st.goback} },
+
+      { {ev.indockingrange, st.moving},     { &App::gotodockspeed, st.docking} },
       { {ev.inlatchingrange, st.docking},   { &App::droplatch, st.latching} },
+
       { {ev.latched, st.latching},          { &App::finish, st.docked} },
+      { {ev.timeout, st.latching},          { &App::retryliftlatch, st.unlatching} },
+
+
+      { {ev.timeout, st.moving},            { &App::befree, st.free} },
+      { {ev.timeout, st.docking},           { &App::retryliftlatch, st.unlatching} },
+
+      { {ev.timeout, st.goback},            { &App::befree, st.free} },
+      { {ev.inmainswing, st.goback},        { &App::gotodockspeed, st.docking} },
+
+      { {ev.inmainswing, st.docked},        { &App::befree, st.free} },
       { {ev.manuallatch, st.free},          { &App::finish, st.docked} },
-      { {ev.inmainswing, st.docked},     { &App::befree, st.free} },
+
+      { {ev.stopbuttonpush, st.unlatching}, { &App::befree, st.free} },
+      { {ev.stopbuttonpush, st.moving},     { &App::befree, st.free} },
+      { {ev.stopbuttonpush, st.docking},    { &App::befree, st.free} },
+      { {ev.stopbuttonpush, st.goback},     { &App::befree, st.free} },
+      { {ev.stopbuttonpush, st.latching},   { &App::befree, st.free} },
+
     }, st.free };
 
     struct Target {
@@ -160,6 +186,7 @@ class App {
       uint8_t const btn_stop_msk;
       bool const posdir;
     };
+    static constexpr int intervalms = 10;
   public:
     App()
       : _i2cgpio1("RemoteGpio", Wire, 0)
@@ -179,23 +206,53 @@ class App {
     void latch_go(int32_t pos) { _latch_lift.go(pos); }
     void latch_stop() { _latch_lift.stop(); }
 
+  private:
+    void set_timeout_ms(int t) { _timer_count = (t + intervalms - 1) / intervalms; }
+    void set_timeout_s(int t) { _timer_count = 1000 * t / intervalms; }
+    void stop_timeout() { _timer_count = 0; }
+
     // Action functions
     void liftlatch() {
       _latch_target = _latch_lifted_pos + _latch_drive_margin;
       _docked_target = 0;
+      set_timeout_ms(_unlatch_timeout_ms);
     }
-    void startmoving() {
+    void goliftlatch() {
+      _retry_count = 0;
+      liftlatch();
+    }
+    void preparemove() {
       _torq_target = 0;
-      _velocity_target = _target->move_velocity * (_target->posdir ? 1 : -1);
       _mctl.run();
       _mctl.set_torque(_torq_target);
+      // Token timout - kick into next state if not in docking range
+      set_timeout_ms(intervalms*2);
     }
-    void decelerate() {
+    void startmainswing() {
+      _velocity_target = _target->move_velocity * (_target->posdir ? 1 : -1);
+      set_timeout_s(_move_timeout);
+    }
+    void gotodockspeed() {
       _velocity_target = _target->docking_velocity * (_target->posdir ? 1 : -1);
+      _velocity_target = int(_velocity_target) * int(100 + _retry_vinc_percent * _retry_count) / 100;
+      set_timeout_s(_dock_timeout);
+    }
+    void goback() {
+      _velocity_target = _target->move_velocity * (_target->posdir ? -1 : 1);
+      set_timeout_s(_goback_timeout);
     }
     void droplatch() {
       _latch_target = _latch_secure_pos - _latch_drive_margin;
       _velocity_target = 0;
+      set_timeout_ms(_latch_timeout_ms);
+    }
+    void retryliftlatch() {
+      _retry_count++;
+      if (_retry_count > _dock_retries) {
+        _appsm.handle_event(ev.noretries);
+      } else {
+        liftlatch();
+      }
     }
     void finish() {
       _mctl.stop();
@@ -204,7 +261,7 @@ class App {
         _target = _target->opposite;
       else
         lg::E() << "NULL Target at finish!";
-
+      stop_timeout();
     }
     void befree() {
       _mctl.stop();
@@ -213,13 +270,12 @@ class App {
       _docked_target = 0;
       _latch_target = _latch_secure_pos - _latch_drive_margin;
       _velocity_target = 0;
+      stop_timeout();
     }
 
     void donothing() {}
-  private:
     void control_task()
     {
-      constexpr int intervalms = 10;
       unsigned count = 0;
       uint8_t last_ctl_in = 0x0f;
       vTaskDelay(2000 / portTICK_PERIOD_MS);
@@ -246,6 +302,12 @@ class App {
         vTaskDelay(sleept / portTICK_PERIOD_MS);
         tms = millis();
         ++count;
+        if (_timer_count > 0) {
+          --_timer_count;
+          if (_timer_count == 0)
+            _appsm.handle_event(ev.timeout);
+        }
+
         uint8_t ctl_in = _i2cgpio1.get();
         uint8_t ctl_new = (~last_ctl_in & ctl_in);
         last_ctl_in = ctl_in;
@@ -379,6 +441,13 @@ class App {
     tunable::Item<uint16_t> _latch_drive_margin = {"latch-overdrive-mm", 5};
     tunable::Item<uint16_t> _move_torque = {"drv-torque", 3000};
     tunable::Item<uint16_t> _delta_torque = {"delta-torque", 1000};
+    tunable::Item<uint16_t> _latch_timeout_ms = {"latch-timeout-ms", 3000};
+    tunable::Item<uint16_t> _unlatch_timeout_ms = {"unlatch-timeout-ms", 5000};
+    tunable::Item<uint16_t> _dock_timeout = {"dock-timeout-s", 10};
+    tunable::Item<uint16_t> _move_timeout = {"move-timeout-s", 120};
+    tunable::Item<uint16_t> _dock_retries = {"dock-retries", 5};
+    tunable::Item<uint16_t> _retry_vinc_percent = {"retry-vinc-pc", 20};
+    tunable::Item<uint16_t> _goback_timeout = {"goback-timeout-s", 30};
     int16_t _latch_target = 0;
     int16_t _latch_actual = 0;
     tunable::Item<uint16_t> _docking_range = {"dock-range-mm", 500};
@@ -390,6 +459,8 @@ class App {
     int16_t _velocity_target = 0;
     int16_t _velocity_actual = 0;
     int16_t _torq_target = 0;
+    int _timer_count = 0;
+    int _retry_count = 0;
 
 };
 
