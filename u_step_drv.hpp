@@ -67,6 +67,7 @@ class UStepDrv {
     const uint8_t _inh_pin;
     static constexpr auto _pwm_bits = 12;
     static const auto _pwm_max = (1 << _pwm_bits) -1;
+    // ToDo: These should be configurable
     static constexpr std::array<uint32_t, 4> _deadtime_ns = { 4100, 5600, 5400, 8200 };
     static constexpr auto _freq = 15625;
     static constexpr uint32_t dt_comp(uint32_t freq, uint32_t deadtime_ns) { return ((deadtime_ns << _pwm_bits) / 1000) * _freq / 1000000; }

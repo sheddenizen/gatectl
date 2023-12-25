@@ -78,6 +78,7 @@ struct StateMachine {
     A & _app;
     StateTable _state_table;
     State _current_state;
+    Event _last_event = {0};
     void handle_event(Event e) {
       auto it = _state_table.find({ e, _current_state });
       if (it == _state_table.end()) {
@@ -87,8 +88,8 @@ struct StateMachine {
         lg::I() << "Got " << e.name << " event in state " << _current_state.name << ", moving to " << it->second.second.name;
       else
         lg::D() << "Got " << e.name << " event in state " << _current_state.name << ", no change";
-
       _current_state = it->second.second;
+      _last_event = e;
       // Calls to action function may recurse
       (_app.*it->second.first)();
     }
@@ -101,17 +102,14 @@ struct StateMachine {
       }
     }
     char const * current_state_name() const { return _current_state.name; }
+    char const * get_and_clear_last_event_name() {
+      char const * result = _last_event.name ? _last_event.name : "";
+      _last_event.name = 0;
+      return result;
+    }
 };
 
 class App {
-    struct Btn {
-      enum {
-        open = 1 << 7,
-        close = 1 << 6,
-        stop = 1 << 4
-      };
-    };
-
     using sm = StateMachine<App>;
     struct {
       sm::Event const gobuttonpush = { "gobuttonpush" };
@@ -188,14 +186,23 @@ class App {
     };
     static constexpr int intervalms = 10;
   public:
+    struct Btn {
+      enum mask {
+        open = 1 << 7,
+        close = 1 << 6,
+        stop = 1 << 4
+      };
+    };
+
     App()
       : _i2cgpio1("RemoteGpio", Wire, 0)
-      , _drive_angle("Drive", Wire, 800)
+      , _drive_angle("DrvAng", Wire, 800)
       , _batt_mv("Battery", "mV", 39, 0, 0, 2675, 12140)
       , _latch_pos("Latch", "mm", 32, 2580, 13, 1584, 44, ADC_6db)
       , _latch_lift("LatchLift", "mm", 19, 1250, 13, 1750, 44, 8)
       , _mctl(_batt_mv)
-      , _vel_filter(10,8000)
+      , _vel_filter(2,8000)
+      , _vel_servo("vel", 10000, 500, 2000, 100)
       {
         start_control_task();
       }
@@ -205,6 +212,19 @@ class App {
     MotorControl const & get_motor_control() const { return _mctl; }
     void latch_go(int32_t pos) { _latch_lift.go(pos); }
     void latch_stop() { _latch_lift.stop(); }
+    void set_target_vel(int val) {
+      // Enable velocity control servo, but don't start motor control task
+      _vel_servo.set_target(val);
+      _mot_run = true;
+    }
+    void clear_target_vel() {
+      // Stop velocity control and make safe disengage, but don't stop motor control task if started
+      _vel_servo.reset();
+      _mot_run = false;
+      _mctl.disengage();
+    }
+    void sim_btn_push(uint8_t btn_bits) { _btn_sim = btn_bits;}
+    void sim_btn_push(Btn::mask btn_mask) { _btn_sim = btn_mask;}
 
   private:
     void set_timeout_ms(int t) { _timer_count = (t + intervalms - 1) / intervalms; }
@@ -216,35 +236,41 @@ class App {
       _latch_target = _latch_lifted_pos + _latch_drive_margin;
       _docked_target = 0;
       set_timeout_ms(_unlatch_timeout_ms);
+      _telem_countdown = 0;
+      _telem_rate = _telem_high_rate;
     }
     void goliftlatch() {
       _retry_count = 0;
       liftlatch();
     }
     void preparemove() {
-      _torq_target = 0;
+      _vel_servo.reset();
       _mctl.run();
-      _mctl.set_torque(_torq_target);
+      _mot_run = true;
       // Token timout - kick into next state if not in docking range
       set_timeout_ms(intervalms*2);
     }
     void startmainswing() {
-      _velocity_target = _target->move_velocity * (_target->posdir ? 1 : -1);
+      _vel_servo.set_target(_target->move_velocity * (_target->posdir ? 1 : -1));
       set_timeout_s(_move_timeout);
+      _telem_countdown = 0;
     }
     void gotodockspeed() {
-      _velocity_target = _target->docking_velocity * (_target->posdir ? 1 : -1);
-      _velocity_target = int(_velocity_target) * int(100 + _retry_vinc_percent * _retry_count) / 100;
+      int vtarg = _target->docking_velocity * (_target->posdir ? 1 : -1);
+      _vel_servo.set_target(vtarg * int(100 + _retry_vinc_percent * _retry_count) / 100);
       set_timeout_s(_dock_timeout);
+      _telem_countdown = 0;
     }
     void goback() {
-      _velocity_target = _target->move_velocity * (_target->posdir ? -1 : 1);
+      _vel_servo.set_target(_target->move_velocity * (_target->posdir ? -1 : 1));
       set_timeout_s(_goback_timeout);
+      _telem_countdown = 0;
     }
     void droplatch() {
       _latch_target = _latch_secure_pos - _latch_drive_margin;
-      _velocity_target = 0;
+      _vel_servo.set_target(0);
       set_timeout_ms(_latch_timeout_ms);
+      _telem_countdown = 0;
     }
     void retryliftlatch() {
       _retry_count++;
@@ -256,24 +282,33 @@ class App {
     }
     void finish() {
       _mctl.stop();
+      _mot_run = false;
+      _vel_servo.reset();
       _docked_target = _target;
       if (_target)
         _target = _target->opposite;
       else
         lg::E() << "NULL Target at finish!";
       stop_timeout();
+      _telem_countdown = 0;
+      _telem_rate = _telem_low_rate;
     }
     void befree() {
       _mctl.stop();
+      _mot_run = false;
+      _vel_servo.reset();
+
       lg::D() << "befree: Clearing target";
       _target = 0;
       _docked_target = 0;
       _latch_target = _latch_secure_pos - _latch_drive_margin;
-      _velocity_target = 0;
+      _vel_servo.reset();
       stop_timeout();
+      _telem_countdown = 0;
+      _telem_rate = _telem_low_rate;
     }
-
     void donothing() {}
+
     void control_task()
     {
       unsigned count = 0;
@@ -308,17 +343,21 @@ class App {
             _appsm.handle_event(ev.timeout);
         }
 
-        uint8_t ctl_in = _i2cgpio1.get();
-        uint8_t ctl_new = (~last_ctl_in & ctl_in);
-        last_ctl_in = ctl_in;
-
-        if (_target && (ctl_new & _target->btn_stop_msk))
-          _appsm.handle_event(ev.stopbuttonpush);
-
         int16_t drive_angle = _drive_angle.mrad();
         _latch_actual = _latch_pos();
 
-        if (!_target) {
+        uint8_t ctl_in = _i2cgpio1.get();
+        if (_btn_sim) {
+          lg::I() << "Simulated Button Push: 0x" << std::hex << unsigned(_btn_sim);
+          ctl_in |= _btn_sim;
+          _btn_sim = 0;
+        }
+        uint8_t ctl_new = (~last_ctl_in & ctl_in);
+        last_ctl_in = ctl_in;
+
+        if (_target && (ctl_new & _target->btn_stop_msk)) {
+          _appsm.handle_event(ev.stopbuttonpush);
+        } else if (!_target) {
           if (ctl_new & _open_target.btn_go_msk)
               _target = &_open_target;
           if (ctl_new & _close_target.btn_go_msk)
@@ -363,20 +402,11 @@ class App {
         last_drive_angle = drive_angle;
         _velocity_actual = _vel_filter(da_delta);
 
-        int vel_error =  _velocity_target - _velocity_actual;
-
-        if (vel_error > 20)
-          _torq_target += _delta_torque * intervalms / 1000;
-          if (_torq_target > _move_torque)
-            _torq_target = _move_torque;
-
-        if (vel_error < 20)
-          _torq_target -= _delta_torque * intervalms / 1000;
-          if (_torq_target <  -_move_torque)
-            _torq_target = - _move_torque;
-
-        // Motor control is negative wrt drive shaft because gears
-        _mctl.set_torque(-_torq_target);
+        // Motor control is negative wrt drive shaft because gears. Don't set unless we have atarget - this makes manual testing easier
+        if (_mot_run && _mctl.running()) {
+          _torq_target  = _vel_servo.loop(_velocity_actual);
+          _mctl.set_torque(-_torq_target);
+        }
 
         if (_latch_actual < _latch_secure_pos)
           _appsm.handle_event(ev.latched);
@@ -389,10 +419,11 @@ class App {
         if (_latch_target < _latch_lift.get_last_pos())
           _latch_lift.go(_latch_target);
 
-
-        if (count % (_mctl.running() ? 50 : 500) == 0) {
+        if (_telem_countdown == 0) {
+          _telem_countdown = _telem_rate;
           collect_and_send_stats();
         }
+        _telem_countdown--;
 
       }
     }
@@ -407,21 +438,25 @@ class App {
           auto s = _mctl.get_last_stats();
           std::ostringstream os;
           os << "{\"run\":" << _mctl.running()
-             << ",\"dra_mrad\":" << _drive_angle.mrad(_drive_angle.last_raw())
-             << ",\"Vdact_mmps\":" << _velocity_actual
-             << ",\"Vdtrg_mmps\":" << _velocity_target
-             << ",\"Vb_mV\":" << _batt_mv()
-             << ",\"Plat_mm\":" << _latch_actual;
-             /* << ",\"Tup_ms\":" << tms
-             << ",\"N\":" << count */;
+             << ",\"drv_a_mrad\":" << _drive_angle.mrad(_drive_angle.last_raw())
+             << ",\"drv_vact_mmps\":" << _velocity_actual
+             << ",\"batt_V_mV\":" << _batt_mv()
+             << ",\"gate_state\":\"" << _appsm.current_state_name()
+             << "\",\"ev_last\":\"" << _appsm.get_and_clear_last_event_name()
+             << "\",\"latch_pos_mm\":" << _latch_actual
+          ;
           if (_mctl.running()) {
-            os << ",\"f_Hz\":" << s.rate
-              << ",\"sp_Hz\":" << s.speed
-              << ",\"Ia_mA\":" << s.mot_i_a
-              << ",\"Ib_mA\":" << s.mot_i_b
-              << ",\"Vd_mV\":" << s.drive
-              << ",\"Ta_Nm\":" << s.torque
-              /* << ",\"Tt_Nm\":" << torq_target */;
+            os << ",\"mot_f_Hz\":" << s.rate
+              << ",\"mot_sp_Hz\":" << s.speed
+              << ",\"mot_Ia_mA\":" << s.mot_i_a
+              << ",\"mot_Ib_mA\":" << s.mot_i_b
+              << ",\"mot_V_mV\":" << s.drive
+              << ",\"drv_Tqact_nNm\":" << -s.torque
+              << ",\"drv_Tqtgt_nNm\":" << _torq_target
+              << ",\"mot_srv_intg\":" << _mctl.get_integral()
+              << ",\"drv_vtgt_mmps\":" << _vel_servo.get_target()
+              << ",\"drv_srv_intg\":" << _vel_servo.get_integral()
+              ;
           }
           os << "}";
           _telem_send_fn(os.str());
@@ -439,8 +474,6 @@ class App {
     tunable::Item<uint16_t> _latch_lifted_pos = {"latch-lift-thres-mm", 30};
     tunable::Item<uint16_t> _latch_secure_pos = {"latch-secure-thres-mm", 10};
     tunable::Item<uint16_t> _latch_drive_margin = {"latch-overdrive-mm", 5};
-    tunable::Item<uint16_t> _move_torque = {"drv-torque", 3000};
-    tunable::Item<uint16_t> _delta_torque = {"delta-torque", 1000};
     tunable::Item<uint16_t> _latch_timeout_ms = {"latch-timeout-ms", 3000};
     tunable::Item<uint16_t> _unlatch_timeout_ms = {"unlatch-timeout-ms", 5000};
     tunable::Item<uint16_t> _dock_timeout = {"dock-timeout-s", 10};
@@ -452,15 +485,21 @@ class App {
     int16_t _latch_actual = 0;
     tunable::Item<uint16_t> _docking_range = {"dock-range-mm", 500};
     tunable::Item<uint16_t> _gate_radius = {"gate-radius-mm", 2850};
+    tunable::Item<uint16_t> _telem_high_rate = {"telem-hi-rate", 25};
+    tunable::Item<uint16_t> _telem_low_rate = {"telem-lo-rate", 200};
     Target const * _target = 0;
     Target const * _docked_target = 0;
-    Target _open_target = {&_close_target, {"op-thres-mrad", 1630}, {"op-vdock-mmps", 100}, {"op-v-mmps", 200}, "open", Btn::open, Btn::open | Btn::stop, false };
-    Target _close_target = {&_open_target, {"cl-thres-mrad", 4667}, {"cl-vdock-mmps", 100}, {"cl-v-mmps", 200}, "close", Btn::close, Btn::close | Btn::stop, true };
-    int16_t _velocity_target = 0;
+    Target _open_target = {&_close_target, {"op-thres-mrad", 1630}, {"op-vdock-mmps", 100}, {"op-v-mmps", 200}, "open", Btn::open, Btn::close | Btn::stop, false };
+    Target _close_target = {&_open_target, {"cl-thres-mrad", 4667}, {"cl-vdock-mmps", 100}, {"cl-v-mmps", 200}, "close", Btn::close, Btn::open | Btn::stop, true };
+    Servo _vel_servo;
     int16_t _velocity_actual = 0;
     int16_t _torq_target = 0;
     int _timer_count = 0;
     int _retry_count = 0;
+    bool _mot_run = false;
+    uint16_t _telem_rate = _telem_low_rate;
+    uint16_t _telem_countdown = 0;
+    uint8_t _btn_sim = 0;
 
 };
 
@@ -470,9 +509,8 @@ std::ostream & operator << (std::ostream & os, App const & app) {
   if (app._target) {
     os << " Tgt="
       << app._target->name 
-      << "(Dt=" << app._target->latch_threshold_mrad 
-      << ",Vt=" << app._velocity_target
-      << ",Tt=" << app._torq_target << ") ";
+      << "(Dt=" << app._target->latch_threshold_mrad << ' '
+      << app._vel_servo << ") ";
   }
 
   os << app._drive_angle << ' '
@@ -607,6 +645,11 @@ void add_control_app_cmds(App & app)
   cli_exec.add_command("get-i2c-gpio1", [&app](){return unsigned(app.get_i2c_gpio1().get()); }, "Get i2c gpio 1 inputs");
   cli_exec.add_command("latch-go", [&app](int pos){app.latch_go(pos); return "Ok";}, "Go to latch position mm");
   cli_exec.add_command("latch-stop", [&app](){app.latch_stop(); return "Ok"; }, "Disengage latch servo");
+  cli_exec.add_command("vel", [&app](int vel){app.set_target_vel(vel); return "Ok";}, "Set gate target velocity and enable vel servo");
+  cli_exec.add_command("veloff", [&app](){app.clear_target_vel(); return "Ok";}, "Reset target velocity and disable vel servo");
+  cli_exec.add_command("btn-open", [&app](){app.sim_btn_push(App::Btn::open); return "Ok";}, "Simulate open button push");
+  cli_exec.add_command("btn-close", [&app](){app.sim_btn_push(App::Btn::close); return "Ok";}, "Simulate close button push");
+  cli_exec.add_command("btn-stop", [&app](){app.sim_btn_push(App::Btn::stop); return "Ok";}, "Simulate stop button push");
 }
 
 void setup() {

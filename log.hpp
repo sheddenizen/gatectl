@@ -35,6 +35,7 @@ class LogStream {
           Serial.print("Log overflow, ");
           Serial.print(_overflow_count);
           Serial.println(" entries lost");
+          _overflow_count = 0;
         }
         _log.clear();
         xSemaphoreGive(_mutex);
@@ -48,7 +49,7 @@ class LogStream {
     std::string _log;
     SemaphoreHandle_t _mutex;
     unsigned _overflow_count = 0;
-    unsigned _log_level = 5;
+    unsigned _log_level = 4;
 };
 
 class Raw {

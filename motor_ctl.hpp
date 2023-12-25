@@ -19,39 +19,67 @@
 
 class Servo {
   public:
-    Servo(std::string name, unsigned drive_limit, int gain_n, int gain_d, int lp_ff_percent)
+    Servo(std::string name, unsigned drive_limit, int32_t gain_p, int32_t gain_i, int32_t gain_div)
       : _name(name)
-      , _drive_limit(name+ "lim", drive_limit)
-      , _gain_n(name + "pgain", gain_n)
-      , _gain_d(gain_d)
-      , _lpf(lp_ff_percent, 60000)
+      , _drive_limit(name+ "_lim", drive_limit)
+      , _gain_p(name + "_pgain", gain_p)
+      , _gain_i(name + "_igain", gain_i)
+      , _gain_div(gain_div)
+      , _last_t_us(micros())
     {}
     void set_target(int target) {
       _target = target;
     }
+    int get_target() const { return _target; }
+
     int loop(int actual) {
       _last_actual = actual;
-      _filt_actual = _lpf(_last_actual);
-      _drive = (_target - _filt_actual) * _gain_n / _gain_d;
-      _drive = _drive > _drive_limit ? _drive_limit : _drive;
-      _drive = _drive < -_drive_limit ? -_drive_limit : _drive;
+      int error = _target - actual;
+      uint32_t t_now = micros();      
+      uint32_t dt = t_now - _last_t_us;
+      _last_t_us = t_now;
+      // Reset after a pause and dont try to integrate
+      if (dt > 20000) {
+        _integral = 0;
+        dt = 0;
+      }
+      // Integrated over seconds, pre-divisor
+      _integral += error * int32_t(dt) / 1000 * _gain_i / 1000;
+      int32_t limit = _drive_limit * _gain_div;
+      int32_t drv_pre = error * _gain_p + _integral;
+
+      if (drv_pre > limit) {
+        _integral -= drv_pre - limit;
+        drv_pre = limit;
+      }
+      if (drv_pre < -limit) {
+        _integral -= drv_pre + limit;
+        drv_pre = - limit;
+      }
+      _drive = drv_pre / _gain_div;
       return _drive;
     }
+    void reset() {
+      _integral = 0;
+      _target = 0;
+    }
+    int32_t get_integral() const { return _integral / _gain_div; }
   private:
     std::string _name;
-    int _target = 0;
-    int _last_actual = 0;
-    int _filt_actual = 0;
-    tunable::Item<int> _drive_limit;
-    tunable::Item<int> _gain_n;
-    int const _gain_d;
-    LpFilter _lpf;
-    int _drive = 0;
+    int32_t _target = 0;
+    int32_t _last_actual = 0;
+    int32_t _integral = 0;
+    tunable::Item<int32_t> _drive_limit;
+    tunable::Item<int32_t> _gain_p;
+    tunable::Item<int32_t> _gain_i;
+    int32_t const _gain_div;
+    int32_t _drive = 0;
     friend std::ostream & operator << (std::ostream & os, Servo const & srv);
+    uint32_t _last_t_us;
 };
 
 std::ostream & operator << (std::ostream & os, Servo const & srv) {
-  os << srv._name << " servo: Target: " << srv._target << " Actual" << ": " << srv._last_actual << " Filt:" << srv._filt_actual << " Drive: " << srv._drive;
+  os << srv._name << "_servo: Tgt=" << srv._target << " Act=" << srv._last_actual << " Int=" << srv._integral << " Out=" << srv._drive;
   return os;
 }
 
@@ -79,7 +107,8 @@ class MotorControl {
       , _batt_mv(batt_mv)
       , _mot_drive({25,26,27,13}, 23)
       , _commutator(_mot_drive, _mot_angle, _batt_mv, 10000)
-      , _torque_servo("torq", 3000, 500, 1000, 2)
+      , _torque_servo("torq", 3000, 500, 5000, 1000)
+      , _torq_lpf(2, 60000)
     {
       start_motor_task();
     }
@@ -117,6 +146,7 @@ class MotorControl {
     }
     void disengage() {
       _torque_mode = false;
+      _torque_servo.reset();
       _commutator.disengage();
     }
     int mot_direct_step(unsigned angle, unsigned magmv) {
@@ -143,6 +173,9 @@ class MotorControl {
       }
       return std::make_tuple(aav/count,bav/count);
     }
+    int32_t get_integral() const {
+      return _torque_servo.get_integral();
+    }
     void reset_stats()
     {
       _last_stats = calc_stats();
@@ -160,7 +193,8 @@ class MotorControl {
           auto torque = _torque();
           _stats.torque += torque;
           if (_torque_mode) {
-            auto drive = _torque_servo.loop(torque);
+            int tq_filt = _torq_lpf(torque);
+            auto drive = _torque_servo.loop(tq_filt);
             _commutator.set_drive_mv(drive);
           }
           _stats.drive += _commutator.get_drive_mv();
@@ -207,6 +241,7 @@ class MotorControl {
     UStepDrv _mot_drive;
     CommutatorCtl _commutator;
     Servo _torque_servo;
+    LpFilter _torq_lpf;
     bool _torque_mode = false;
     TaskHandle_t _mot_task = 0;
     bool _run = false;
@@ -229,8 +264,10 @@ std::ostream & operator << (std::ostream & os, MotorControl::stats const & s) {
 
 std::ostream & operator << (std::ostream & os, MotorControl const & mctl) {
   os << (mctl._run ? "Run " : "Stop ")
-     << mctl.get_last_stats() << ' '
-     << mctl._commutator
+     << mctl.get_last_stats() << ' ';
+  if (mctl._torque_mode)
+    os << mctl._torque_servo << ' ';
+  os << mctl._commutator
      << ' ' << mctl._mot_current_a << ' ' << mctl._mot_current_b;
   return os;
 }

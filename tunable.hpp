@@ -83,8 +83,10 @@ class Item
 
 inline void set_cli_executor(cli::Executor & cli_exec)
 {
-  // ToDo: this wonderful mechanism only works if every T is int16_t
+  // ToDo: this wonderful mechanism only works if you know what T you want
   Item<int16_t>(&cli_exec).deferred_register();
+  Item<int32_t>(&cli_exec).deferred_register();
+  Item<uint16_t>(&cli_exec).deferred_register();
 }
 
 } // tunable
