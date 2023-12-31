@@ -11,26 +11,13 @@
 
 class CommutatorCtl {
   public:
-    CommutatorCtl(UStepDrv & mot_drive, AS5600PosnSensor & rotor_pos, AnalogIn & supply_mv, unsigned supply_cutoff_mv)
-      : _mot_drive(mot_drive), _rotor_pos(rotor_pos), _supply_mv(supply_mv), _supply_cutoff_mv(supply_cutoff_mv), _base_phase_advance("phaseadv", 64)
+    CommutatorCtl(UStepDrv & mot_drive, AS5600PosnSensor & rotor_pos)
+      : _mot_drive(mot_drive), _rotor_pos(rotor_pos), _base_phase_advance("phaseadv", 64)
     {}
+    void set_batt_mv(int mvolts) {
+      _last_supply = mvolts;
+    }
     void set_drive_mv(int mvolts) {
-      _last_supply = _supply_mv();
-/*      if (_last_supply < _supply_cutoff_mv) {
-        if (_supply_filt > 100000) {
-          _mot_drive.disable();
-          _recover_count = 100;
-          _supply_filt = 0;
-          return;
-        } else {
-          _supply_filt += _supply_cutoff_mv - _last_supply;
-        }
-      }
-      if (_recover_count > 0) {
-        _recover_count--;
-        return;
-      }
-*/
       _drive_phase = mvolts < 0 ? -_base_phase_advance : _base_phase_advance;
       unsigned abs_mvolts = mvolts < 0 ? -mvolts : mvolts;
       abs_mvolts = abs_mvolts < _last_supply ? abs_mvolts : _last_supply;
@@ -58,6 +45,8 @@ class CommutatorCtl {
       _last_phase_pos = phase_pos;
     }
     unsigned last_pos() const { return _last_pos; }
+    // For when we are not actively controlling the motor
+    unsigned get_rotor_pos() { return _rotor_pos(); }
     int get_drive_mv() const { return _drive_mv; }
   private:
     unsigned sens_to_phase(uint16_t sens) {
@@ -67,8 +56,6 @@ class CommutatorCtl {
     }
     UStepDrv & _mot_drive;
     AS5600PosnSensor & _rotor_pos;
-    AnalogIn & _supply_mv;
-    unsigned const _supply_cutoff_mv;
     int _last_supply = 0;
     int _drive_mv = 0;
     unsigned _drive16 = 0;

@@ -17,6 +17,65 @@
 #include <ostream>
 #include <iomanip>
 
+struct errorcode {
+  enum faults {
+    driverA,
+    driverB,
+    motSensor,
+    undervoltage,
+    driveSensor,
+    torqueRange,
+    latchSensor,
+    latchFailure,
+  };
+  enum {
+    numFaults = 8
+  };
+  char const * description(unsigned fault) const {
+    static std::array<char const *, numFaults> const descriptions = {{
+      "Phase A Driver Fault",
+      "Phase B Driver Fault",
+      "Motor Shaft Sensor Fault",
+      "Battery Undervoltage",
+      "Drive Shaft Sensor Fault",
+      "Torque out of Range",
+      "Latch Sensor Out of Range",
+      "Latch Inoperable",
+    }};
+    return fault < numFaults ? descriptions[fault] : 0;
+  }
+  unsigned val = 0;
+  operator bool() const { return val != 0; }
+  errorcode & operator|= (errorcode e) {
+    val |= e.val;
+    return *this;
+  }
+  void raiseifset(bool cond, faults fault) {
+    if (cond)
+      val |= 1 << fault;
+  }
+  errorcode getandreset() {
+    errorcode copy = *this;
+    val = 0;
+    return copy;
+  }
+  bool israised(unsigned fault) const { return val & (1 << fault); }
+};
+
+bool operator==(errorcode e1, errorcode e2) { return e1.val == e2.val; }
+
+std::ostream & operator<< (std::ostream & os, errorcode const & e) {
+  char const * s = "";
+  char const * const sep = ",";
+  for (unsigned f=0; f < e.numFaults; ++f) {
+    if (e.israised(f)) {
+      os << s << e.description(f);
+      s = sep;
+    }
+  }
+  return os;
+};
+
 class Servo {
   public:
     Servo(std::string name, unsigned drive_limit, int32_t gain_p, int32_t gain_i, int32_t gain_div)
@@ -93,6 +152,8 @@ class MotorControl {
       int torque = 0;
       int count = 0;
       int drive = 0;
+      int batt_mv = 0;
+      int batt_min_mv = 0;
       uint32_t tstart = 0;
       uint32_t tlast = 0;
       int speed = 0;
@@ -106,7 +167,7 @@ class MotorControl {
       , _torque("Torque", "mNm", 36, 1725, 0, 1560, -7897)
       , _batt_mv(batt_mv)
       , _mot_drive({25,26,27,13}, 23)
-      , _commutator(_mot_drive, _mot_angle, _batt_mv, 10000)
+      , _commutator(_mot_drive, _mot_angle)
       , _torque_servo("torq", 3000, 500, 5000, 1000)
       , _torq_lpf(2, 60000)
     {
@@ -115,17 +176,21 @@ class MotorControl {
 
     bool run()
     {
-      if (_run)
+      bool wasRunning = _run;
+      _run = true;
+      if (!wasRunning) {
+        vTaskResume(_mot_task);
         vTaskDelay(1);
-      vTaskResume(_mot_task);
-      vTaskDelay(1);
-      return _run;
+      }
+      return true;
     }
     bool stop()
     {
+      bool wasRunning = _run;
       _run = false;
-      vTaskDelay(1);
-      return !_run;
+      if (wasRunning)
+        vTaskDelay(1);
+      return true;
     }
     bool run_test() { 
       if (!_run) {
@@ -158,10 +223,8 @@ class MotorControl {
       // Result: pulse width in us, trying not to overflow - 15625/1024 = 10^6 / 2^16
       return magabs * 15625 / _mot_drive.freq() / 1024;
     }
-    bool error() {
-      //todo...
-      return _mot_angle.error();
-    }
+    errorcode error() { return _error; }
+
     std::tuple<int, int> get_phase_currents() {
       int aav = 0;
       int bav = 0;
@@ -185,30 +248,61 @@ class MotorControl {
       _stats.start_pos = _commutator.last_pos();
     }
     stats const & get_last_stats() const { return _last_stats; }
-
   private:
+    // Hopefully in between the highest possible operational current and the fault output
+    static constexpr int phase_fault_threshold = 18000;
+    // Double what we can generate
+    static constexpr int torque_fault_threshold = 60000;
+    static constexpr int batt_undervoltage_mv = 11000;
+    static constexpr int idleSleepIntervalticks = 100 / portTICK_PERIOD_MS;
+
     void motor_task() {
+      bool wasRunning  = _run;
       for (;;) {
-        while (_run) {
-          auto torque = _torque();
-          _stats.torque += torque;
+        int torque = _torque();
+        int batt_mv = _batt_mv();
+        int pos = 0;
+        if(_run) {
+          _commutator.set_batt_mv(batt_mv);
           if (_torque_mode) {
             int tq_filt = _torq_lpf(torque);
             auto drive = _torque_servo.loop(tq_filt);
             _commutator.set_drive_mv(drive);
           }
-          _stats.drive += _commutator.get_drive_mv();
           _commutator.loop();
-          _count++;
-          _stats.count++;
-          _stats.last_pos = _commutator.last_pos();
-          _stats.mot_i_a += _mot_current_a();
-          _stats.mot_i_b += _mot_current_b();
-          _stats.tlast = esp_timer_get_time();
+          pos = _commutator.last_pos();
+          wasRunning = true;
+        } else {
+          if (wasRunning) {
+            disengage();
+          }
+          // Not sure if this does anything useful for power consumption?
+          vTaskDelay(idleSleepIntervalticks);
+          pos = _commutator.get_rotor_pos();
+          wasRunning = false;
         }
-        disengage();
-        vTaskSuspend(_mot_task);
-        _run = true;
+
+        _count++;
+        _stats.count++;
+        _stats.torque += torque;
+        _stats.drive += _commutator.get_drive_mv();
+        _stats.batt_mv += batt_mv;
+        if (_stats.batt_min_mv == 0 || _stats.batt_min_mv > batt_mv)
+          _stats.batt_min_mv = batt_mv;
+        _stats.last_pos = pos;
+        int ia = _mot_current_a();
+        _stats.mot_i_a += ia;
+        int ib = _mot_current_b();
+        _stats.mot_i_b += ib;
+        _stats.tlast = esp_timer_get_time();
+        errorcode error;
+        // Current sense goes high if driver detects a fault
+        error.raiseifset(ia > phase_fault_threshold, errorcode::driverA);
+        error.raiseifset(ib > phase_fault_threshold, errorcode::driverB);
+        error.raiseifset(_mot_angle.error(), errorcode::motSensor);
+        error.raiseifset(torque > torque_fault_threshold || torque < -torque_fault_threshold, errorcode::torqueRange);
+        error.raiseifset(batt_mv < batt_undervoltage_mv, errorcode::undervoltage);
+        _error = error;
       }
     }
     void start_motor_task()
@@ -224,6 +318,7 @@ class MotorControl {
       s.mot_i_a /= s.count;
       s.mot_i_b /= s.count;
       s.drive /= s.count;
+      s.batt_mv /= s.count;
       s.torque /= s.count;
       s.speed = (s.last_pos - s.start_pos) & 4095;
       s.speed = s.speed >= 2048 ? -(4096 - s.speed) : s.speed;
@@ -246,6 +341,7 @@ class MotorControl {
     TaskHandle_t _mot_task = 0;
     bool _run = false;
     unsigned _count = 0;
+    errorcode _error;
     stats _stats;
     stats _last_stats;
     friend std::ostream & operator << (std::ostream & os, MotorControl const & mctl);

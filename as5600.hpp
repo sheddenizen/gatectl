@@ -21,13 +21,14 @@ class AS5600PosnSensor {
       int retries = 1;
       int byte_count;
 
-      while ((byte_count = _i2c.available()) < 2 && --retries) {
+      while ((byte_count = _i2c.available()) < 2 && retries) {
+        --retries;
         lg::W() << "Sensor " << _name << " got " << byte_count << " bytes with " << retries << " retries left";
         delay(1);
-        if (!retries) {
-          _error = true;
-          return _last_raw;
-        }
+      }
+      if (!retries && byte_count < 2) {
+        _error = true;
+        return _last_raw;
       }
       uint16_t val = _i2c.read();
       val = (val << 8) | _i2c.read();
