@@ -19,6 +19,7 @@ class Netw {
     wl_status_t wifi_state() const { return WiFi.status(); }
     void poll();
     void setup_net();
+    void collect_telem(std::ostream & os);
     std::string const & hostname() const { return _hostname; }
   private:
     void task();

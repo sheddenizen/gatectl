@@ -197,6 +197,7 @@ class App {
     };
     static constexpr int intervalms = 10;
     static constexpr int recoverytimems = 5000;
+    static constexpr uint16_t min_telem_count = 10;
   public:
     struct Btn {
       enum mask {
@@ -205,7 +206,15 @@ class App {
         stop = 1 << 4
       };
     };
-
+    struct Telltale {
+      enum mode {
+        telem_short,
+        telem_long,
+        error_blink,
+        slow_wink,
+      };
+    };
+    using TelemCollectFn = std::function<void(std::ostream &)>;
     App()
       : _i2cgpio1("RemoteGpio", Wire, 0)
       , _drive_angle("DrvAng", Wire, 800)
@@ -214,16 +223,16 @@ class App {
       , _latch_lift("LatchLift", "mm", 19, 1250, 13, 1750, 44, 8)
       , _mctl(_batt_mv)
       , _vel_filter(2,8000)
-      , _vel_servo("vel", 10000, 500, 2000, 100)
+      , _vel_servo("vel", 20000, 500, 2000, 100)
       {
         start_control_task();
       }
-    void set_telem_sender(std::function<void(std::string const &)> fn) { _telem_send_fn = fn; }
+    void set_telem_req_fn(std::function<void(TelemCollectFn const &)> fn) { _telem_req_fn = fn; }
     PCF8574Gpio const get_i2c_gpio1() { return _i2cgpio1; }
     MotorControl & get_motor_control() { return _mctl; }
     MotorControl const & get_motor_control() const { return _mctl; }
-    void latch_go(int32_t pos) { _latch_lift.go(pos); }
-    void latch_stop() { _latch_lift.stop(); }
+    void latch_go(int32_t pos) { _latch_target = pos; }
+    void latch_lock() { _latch_target = _latch_secure_pos - _latch_drive_margin; }
     void set_target_vel(int val) {
       // Enable velocity control servo, but don't start motor control task
       _vel_servo.set_target(val);
@@ -239,8 +248,45 @@ class App {
     void sim_btn_push(Btn::mask btn_mask) { _btn_sim = btn_mask;}
     void set_telem_rate(uint16_t rate) {
       _telem_rate = rate;
-      _telem_countdown = 0;
+      if (_telem_countdown > min_telem_count)
+        _telem_countdown = min_telem_count;
     };
+    void set_telltale(Telltale::mode mode) { _telltale_mode = mode; }
+    void collect_and_serialize_stats(std::ostream & os) {
+          _mctl.reset_stats();
+          auto s = _mctl.get_last_stats();
+          os << "\"run\":" << _mctl.running()
+             << ",\"loop_count\":" << _count
+             << ",\"drv_a_mrad\":" << _drive_angle.mrad(_drive_angle.last_raw())
+             << ",\"drv_vact_mmps\":" << _velocity_actual
+             << ",\"batt_V_mV\":" << s.batt_mv
+             << ",\"batt_Vmin_mV\":" << s.batt_min_mv
+             << ",\"gate_state\":\"" << _appsm.current_state_name()
+             << "\",\"ev_last\":\"" << _appsm.get_and_clear_last_event_name()
+             << "\",\"latch_pos_mm\":" << _latch_actual
+             << ",\"mot_Ia_mA\":" << s.mot_i_a
+             << ",\"mot_Ib_mA\":" << s.mot_i_b
+             << ",\"drv_Tqact_nNm\":" << s.torque
+             << ",\"err_flags\":" << _error.val
+            ;
+          if (_error)
+            os << ",\"error_desc\":\"" << _error << "\"";
+          else
+            os << ",\"error_desc\":\"None\"";
+
+          if (_mctl.running()) {
+            os << ",\"mot_f_Hz\":" << s.rate
+              << ",\"mot_sp_Hz\":" << s.speed
+              << ",\"mot_V_mV\":" << s.drive
+              << ",\"drv_Tqtgt_nNm\":" << _mctl.get_torque_tgt()
+              << ",\"mot_srv_intg\":" << _mctl.get_integral()
+              << ",\"drv_vtgt_mmps\":" << _vel_servo.get_target()
+              << ",\"drv_srv_intg\":" << _vel_servo.get_integral()
+              << ",\"mot_Iapk_mA\":" << s.mot_ipk_a
+              << ",\"mot_Ibpk_mA\":" << s.mot_ipk_b
+              ;
+          }
+    }
   private:
     void set_timeout_ms(int t) { _timer_count = (t + intervalms - 1) / intervalms; }
     void set_timeout_s(int t) { _timer_count = 1000 * t / intervalms; }
@@ -256,6 +302,7 @@ class App {
     void goliftlatch() {
       _retry_count = 0;
       liftlatch();
+      set_telltale(Telltale::telem_short);
     }
     void preparemove() {
       _vel_servo.reset();
@@ -292,6 +339,7 @@ class App {
         _appsm.handle_event(ev.noretries);
       } else {
         liftlatch();
+        set_telltale(Telltale::telem_long);
       }
     }
     void finish() {
@@ -305,6 +353,7 @@ class App {
         lg::E() << "NULL Target at finish!";
       stop_timeout();
       set_telem_rate(_telem_low_rate);
+      set_telltale(Telltale::slow_wink);
     }
     void befree() {
       _mctl.stop();
@@ -318,11 +367,13 @@ class App {
       _vel_servo.reset();
       stop_timeout();
       set_telem_rate(_telem_low_rate);
+      set_telltale(Telltale::telem_short);
     }
     void errorfree() {
       befree();
       lg::E() << "Transition into error state: " << _error;
       set_timeout_ms(recoverytimems);
+      set_telltale(Telltale::error_blink);
     }
     void errorpersist() {
       set_timeout_ms(recoverytimems);
@@ -331,11 +382,11 @@ class App {
       stop_timeout();
       _target = 0;
       _telem_countdown = 1;
+      set_telltale(Telltale::telem_short);
     }
 
     void control_task()
     {
-      unsigned count = 0;
       uint8_t last_ctl_in = 0x0f;
       vTaskDelay(2000 / portTICK_PERIOD_MS);
       lg::I() << "Start control loop";
@@ -346,7 +397,7 @@ class App {
 
       // Start latch in the latch positon
       _latch_target = _latch_secure_pos - _latch_drive_margin;
- 
+      TelemCollectFn const telem_collect_fn([this](std::ostream &os){ this->collect_and_serialize_stats(os); });
       for (;;) {
         ttarg += intervalms;
         tms = millis();
@@ -361,8 +412,7 @@ class App {
         if (sleept < 0)
           sleept = 0;
         vTaskDelay(sleept / portTICK_PERIOD_MS);
-        tms = millis();
-        ++count;
+        ++_count;
         if (_timer_count > 0) {
           --_timer_count;
           if (_timer_count == 0)
@@ -452,59 +502,46 @@ class App {
 
         // Slow lift, fast drop
         int lp = _latch_lift.get_last_pos();
-        if (_latch_target > lp && count % 4 == 0)
+        if (_latch_target > lp && _count % 4 == 0)
           _latch_lift.go(lp + 1);
         if (_latch_target < lp)
           _latch_lift.go(lp - 2 < _latch_target ? _latch_target : lp - 2);
 
+        teltale_update();
         if (_telem_countdown == 0) {
           _telem_countdown = _telem_rate;
-          collect_and_send_stats();
+          _telem_req_fn(telem_collect_fn);
         }
         _telem_countdown--;
 
       }
     }
-
+    void set_telltale_led(bool on) {
+      _i2cgpio1.set(0, !on, false);
+    }
+    void teltale_update() {
+      switch (_telltale_mode) {
+        case Telltale::telem_short:
+          set_telltale_led(_telem_countdown == 2);
+          break;
+        case Telltale::telem_long:
+          set_telltale_led(_telem_countdown > 1 && _telem_countdown < min_telem_count);
+          break;
+        case Telltale::error_blink:
+          {
+            unsigned tms = millis();
+            set_telltale_led((tms % 3000) < 1000);
+            break;
+          }
+        case Telltale::slow_wink:
+          set_telltale_led((_count & 511) == 0);
+          break;        
+      }
+    }
     void start_control_task()
     {
       lg::I() << "Start Control Task";
       xTaskCreatePinnedToCore([](void *app){ (*(App*)app).control_task(); }, "control_task", 15000, this, 0, &_ctrl_task, 0);
-    }
-    void collect_and_send_stats() {
-          _mctl.reset_stats();
-          auto s = _mctl.get_last_stats();
-          std::ostringstream os;
-          os << "{\"run\":" << _mctl.running()
-             << ",\"drv_a_mrad\":" << _drive_angle.mrad(_drive_angle.last_raw())
-             << ",\"drv_vact_mmps\":" << _velocity_actual
-             << ",\"batt_V_mV\":" << s.batt_mv
-             << ",\"batt_Vmin_mV\":" << s.batt_min_mv
-             << ",\"gate_state\":\"" << _appsm.current_state_name()
-             << "\",\"ev_last\":\"" << _appsm.get_and_clear_last_event_name()
-             << "\",\"latch_pos_mm\":" << _latch_actual
-             << ",\"mot_Ia_mA\":" << s.mot_i_a
-             << ",\"mot_Ib_mA\":" << s.mot_i_b
-             << ",\"drv_Tqact_nNm\":" << -s.torque
-             << ",\"err_flags\":" << _error.val
-            ;
-          if (_error)
-            os << ",\"error_desc\":\"" << _error << "\"";
-          else
-            os << ",\"error_desc\":\"None\"";
-
-          if (_mctl.running()) {
-            os << ",\"mot_f_Hz\":" << s.rate
-              << ",\"mot_sp_Hz\":" << s.speed
-              << ",\"mot_V_mV\":" << s.drive
-              << ",\"drv_Tqtgt_nNm\":" << _torq_target
-              << ",\"mot_srv_intg\":" << _mctl.get_integral()
-              << ",\"drv_vtgt_mmps\":" << _vel_servo.get_target()
-              << ",\"drv_srv_intg\":" << _vel_servo.get_integral()
-              ;
-          }
-          os << "}";
-          _telem_send_fn(os.str());
     }
     PCF8574Gpio _i2cgpio1;    
     AS5600PosnSensor _drive_angle;
@@ -514,10 +551,10 @@ class App {
     TaskHandle_t _ctrl_task =0;
     MotorControl _mctl;
     LpFilter _vel_filter;
-    std::function<void(std::string const &)> _telem_send_fn;
+    std::function<void(TelemCollectFn const &)> _telem_req_fn;
     friend std::ostream & operator << (std::ostream & os, App const & app);
-    tunable::Item<uint16_t> _latch_lifted_pos = {"latch-lift-thres-mm", 30};
-    tunable::Item<uint16_t> _latch_secure_pos = {"latch-secure-thres-mm", 10};
+    tunable::Item<uint16_t> _latch_lifted_pos = {"latch-lift-thres-mm", 33};
+    tunable::Item<uint16_t> _latch_secure_pos = {"latch-secure-thres-mm", 18};
     tunable::Item<uint16_t> _latch_drive_margin = {"latch-overdrive-mm", 5};
     tunable::Item<uint16_t> _latch_timeout_ms = {"latch-timeout-ms", 3000};
     tunable::Item<uint16_t> _unlatch_timeout_ms = {"unlatch-timeout-ms", 5000};
@@ -534,8 +571,8 @@ class App {
     tunable::Item<uint16_t> _telem_low_rate = {"telem-lo-rate", 200};
     Target const * _target = 0;
     Target const * _docked_target = 0;
-    Target _open_target = {&_close_target, {"op-thres-mrad", 4667}, {"op-vdock-mmps", 100}, {"op-v-mmps", 200}, "open", Btn::open, Btn::close | Btn::stop, true };
-    Target _close_target = {&_open_target, {"cl-thres-mrad", 1630}, {"cl-vdock-mmps", 100}, {"cl-v-mmps", 200}, "close", Btn::close, Btn::open | Btn::stop, false };
+    Target _open_target = {&_close_target, {"op-thres-mrad", 4935}, {"op-vdock-mmps", 600}, {"op-v-mmps", 500}, "open", Btn::open, Btn::close | Btn::stop, true };
+    Target _close_target = {&_open_target, {"cl-thres-mrad", 1760}, {"cl-vdock-mmps", 400}, {"cl-v-mmps", 500}, "close", Btn::close, Btn::open | Btn::stop, false };
     Servo _vel_servo;
     int16_t _velocity_actual = 0;
     int16_t _torq_target = 0;
@@ -546,6 +583,8 @@ class App {
     unsigned _telem_countdown = 0;
     uint8_t _btn_sim = 0;
     errorcode _error;
+    uint32_t _count = 0;
+    Telltale::mode _telltale_mode = Telltale::telem_short;
 
 };
 
@@ -620,22 +659,6 @@ std::string serial_get_line(std::function<void()> idlefn)
   return line;
 }
 
-/*
-static std::string taskdump() {
-  using std::setw;
-  std::ostringstream out;
-  int ntask = uxTaskGetNumberOfTasks();
-  std::vector<TaskStatus_t> taskinfo(ntask);
-  uint32_t totalRunTime = 0;
-  uxTaskGetSystemState( &taskinfo[0], ntask, &totalRunTime );
-  for (auto task : taskinfo) {
-    out << setw(10) << task.pcTaskName << setw(3) << task.eCurrentState << setw(9) << task.ulRunTimeCounter << setw(4) << (task.ulRunTimeCounter * 100 / totalRunTime) << '%' << std::endl;
-  }
-  out << "Total Run time: " << totalRunTime;
-  return out.str();
-}
-*/
-
 static std::string taskinfo(std::string name) {
   using std::setw;
   std::ostringstream out;
@@ -690,10 +713,11 @@ void add_control_app_cmds(App & app)
   cli_exec.add_command("get-i2c-gpio", [&app](){return app.get_i2c_gpio1(); }, "Get i2c gpio 1 state");
   cli_exec.add_command("get-i2c-gpio1", [&app](){return unsigned(app.get_i2c_gpio1().get()); }, "Get i2c gpio 1 inputs");
   cli_exec.add_command("latch-go", [&app](int pos){app.latch_go(pos); return "Ok";}, "Go to latch position mm");
-  cli_exec.add_command("latch-stop", [&app](){app.latch_stop(); return "Ok"; }, "Disengage latch servo");
+  cli_exec.add_command("latch-lock", [&app](){app.latch_lock(); return "Ok"; }, "Drop latch to secure position");
   cli_exec.add_command("vel", [&app](int vel){app.set_target_vel(vel); return "Ok";}, "Set gate target velocity and enable vel servo");
   cli_exec.add_command("veloff", [&app](){app.clear_target_vel(); return "Ok";}, "Reset target velocity and disable vel servo");
   cli_exec.add_command("telemrate", [&app](uint16_t rate){app.set_telem_rate(rate); return "Ok";}, "Set telemetry rate in control intervals");
+  cli_exec.add_command("telltale", [&app](unsigned mode){app.set_telltale(App::Telltale::mode(mode)); return "Ok";}, "Set set telltale mode");
   cli_exec.add_command("btn-open", [&app](){app.sim_btn_push(App::Btn::open); return "Ok";}, "Simulate open button push");
   cli_exec.add_command("btn-close", [&app](){app.sim_btn_push(App::Btn::close); return "Ok";}, "Simulate close button push");
   cli_exec.add_command("btn-stop", [&app](){app.sim_btn_push(App::Btn::stop); return "Ok";}, "Simulate stop button push");
@@ -747,8 +771,19 @@ void setup() {
     }
   });
 
-  app->set_telem_sender([](std::string const & s){ mqtt->send("status", s); });
-//  netw->start();
+  auto telem_req_fn = [](std::function<void(std::ostream &)> const & telem_collect_fn) {
+    std::ostringstream os;
+    os << '{';
+    telem_collect_fn(os);
+    os << ',';
+    netw->collect_telem(os);
+    os << '}';
+    mqtt->send_deferred("status", os.str());
+  };
+
+  app->set_telem_req_fn(telem_req_fn);
+
+  //  netw->start();
   netw->setup_net();
 }
 

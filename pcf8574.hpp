@@ -32,13 +32,20 @@ class PCF8574Gpio {
     void set(uint8_t val)
     {
       _i2c.beginTransmission(_addr);
-      _i2c.write(val);
+      size_t written = _i2c.write(val);
       _i2c.endTransmission();
-      _last_set = val;
+      if (written != 1)
+        lg::E() << "Failure writing to i2c " << _name;
+      else
+        _last_set = val;
     }
-    void set(uint8_t bit, bool val) {
-      uint8_t mask = 1 << val;
-      set(val ? _last_set | mask : _last_set & ~mask);
+    void set(uint8_t bit, bool val, bool force=true) {
+      uint8_t mask = 1 << bit;
+      uint8_t newReg = val ? _last_set | mask : _last_set & ~mask;
+      if (force || newReg != _last_set) {
+        set(newReg);
+        // lg::D() << "Wrote " << unsigned(newReg) << " to " << _name";
+      }
     }
     uint8_t last_set() const { return _last_set; }
     uint8_t last_get() const { return _last_raw; }

@@ -148,7 +148,9 @@ class MotorControl {
       unsigned start_pos = 0;
       unsigned last_pos = 0;
       int mot_i_a = 0;
+      int mot_ipk_a = 0;
       int mot_i_b = 0;
+      int mot_ipk_b = 0;
       int torque = 0;
       int count = 0;
       int drive = 0;
@@ -164,11 +166,12 @@ class MotorControl {
       : _mot_angle("Mot", Wire1, 0)
       , _mot_current_a("Mot Phase A", "mA", 34, 64, 0, 1305, 3320)
       , _mot_current_b("Mot Phase B", "mA", 35, 62, 0, 1200, 3001)
-      , _torque("Torque", "mNm", 36, 1725, 0, 1560, -7897)
+//      , _torque("Torque", "mNm", 36, 1725, 0, 1560, -7897) // Calibrated when lying flat
+      , _torque("Torque", "mNm", 36, 1725, 3500, 1560, -4397) // +3.5 Nm approx when vertical
       , _batt_mv(batt_mv)
       , _mot_drive({25,26,27,13}, 23)
       , _commutator(_mot_drive, _mot_angle)
-      , _torque_servo("torq", 3000, 500, 5000, 1000)
+      , _torque_servo("torq", 3000, 500, 3000, 1000)
       , _torq_lpf(2, 60000)
     {
       start_motor_task();
@@ -205,6 +208,7 @@ class MotorControl {
       _torque_mode = true;
       _torque_servo.set_target(mnm);
     }
+    int get_torque_tgt() const { return _torque_servo.get_target(); }
     void set_drive(int mv) {
       _torque_mode = false;
       _commutator.set_drive_mv(mv);
@@ -254,7 +258,7 @@ class MotorControl {
     // Double what we can generate
     static constexpr int torque_fault_threshold = 60000;
     static constexpr int batt_undervoltage_mv = 11000;
-    static constexpr int idleSleepIntervalticks = 100 / portTICK_PERIOD_MS;
+    static constexpr int idleSleepIntervalticks = 80 / portTICK_PERIOD_MS;
 
     void motor_task() {
       bool wasRunning  = _run;
@@ -292,8 +296,12 @@ class MotorControl {
         _stats.last_pos = pos;
         int ia = _mot_current_a();
         _stats.mot_i_a += ia;
+        if (ia > _stats.mot_ipk_a)
+          _stats.mot_ipk_a = ia;
         int ib = _mot_current_b();
         _stats.mot_i_b += ib;
+        if (ib > _stats.mot_ipk_b)
+          _stats.mot_ipk_b = ib;
         _stats.tlast = esp_timer_get_time();
         errorcode error;
         // Current sense goes high if driver detects a fault

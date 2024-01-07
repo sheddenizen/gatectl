@@ -4,6 +4,8 @@
 #include "Arduino.h"
 #include "mqtt_client.h"
 
+#include <utility>
+
 
 typedef unsigned short mqtt_size_t;
 
@@ -18,6 +20,9 @@ typedef struct mqtt_subscription
   mqtt_msg_rx_fn handler;
 
 } mqtt_subscription_t;
+
+
+using SendData = std::pair<std::string, std::string>;
 
 
 esp_err_t Mqtt::mqtt_event_handler_cb(int32_t event_id, esp_mqtt_event_handle_t event)
@@ -93,6 +98,9 @@ void Mqtt::start()
         }, 
         this);
   esp_mqtt_client_start(_client);
+
+  xTaskCreatePinnedToCore([](void *obj){ (*(Mqtt*)obj).send_task(); }, "mqtt_sender", 5000, this, 0, &_send_task, 0);
+  _sendq = xQueueCreate( 1, sizeof(SendData*));
 }
 
 Mqtt::Mqtt(std::string clientname, std::string basetopic, std::string uri)
@@ -123,6 +131,24 @@ bool Mqtt::send(std::string const & topic, std::string const & payload) {
   } else {
     lg::W() << "Failed to enqueue message, topic " << topic;
     return false;
+  }
+}
+
+void Mqtt::send_deferred(std::string && topic, std::string && payload) {
+  SendData *senddata = new SendData;
+  senddata->first.swap(topic);
+  senddata->second.swap(payload);
+
+  xQueueOverwrite(_sendq, &senddata);
+}
+
+void Mqtt::send_task() {
+  for (;;) {
+    SendData *senddata;
+    if (pdTRUE == xQueueReceive(_sendq, &senddata, portMAX_DELAY)) {
+      send(senddata->first, senddata->second);
+      delete senddata;
+    }
   }
 }
 

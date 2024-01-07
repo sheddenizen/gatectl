@@ -99,6 +99,11 @@ void Netw::task()
   }
 }
 
+void Netw::collect_telem(std::ostream & os) {
+  os << "\"ssid\":\"" << WiFi.SSID().c_str()
+     << "\",\"rssi\":" << int(WiFi.RSSI());
+}
+
 std::ostream & operator << (std::ostream & os,  wl_status_t state) {
   static const std::array<char const *, 7> statenames = {{
     "WL_IDLE_STATUS",
