@@ -167,11 +167,11 @@ class MotorControl {
       , _mot_current_a("Mot Phase A", "mA", 34, 64, 0, 1305, 3320)
       , _mot_current_b("Mot Phase B", "mA", 35, 62, 0, 1200, 3001)
 //      , _torque("Torque", "mNm", 36, 1725, 0, 1560, -7897) // Calibrated when lying flat
-      , _torque("Torque", "mNm", 36, 1725, 3500, 1560, -4397) // +3.5 Nm approx when vertical
+      , _torque("Torque", "mNm", 36, 1725, 1500, 1560, -6397) // +1.5 Nm approx when vertical
       , _batt_mv(batt_mv)
       , _mot_drive({25,26,27,13}, 23)
       , _commutator(_mot_drive, _mot_angle)
-      , _torque_servo("torq", 3000, 500, 3000, 1000)
+      , _torque_servo("torq", 3500, 200, 3000, 1000)
       , _torq_lpf(2, 60000)
     {
       start_motor_task();
