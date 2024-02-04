@@ -102,17 +102,24 @@ class Servo {
         _integral = 0;
         dt = 0;
       }
+      int32_t int_last = _integral;
       // Integrated over seconds, pre-divisor
       _integral += error * int32_t(dt) / 1000 * _gain_i / 1000;
       int32_t limit = _drive_limit * _gain_div;
       int32_t drv_pre = error * _gain_p + _integral;
 
       if (drv_pre > limit) {
-        _integral -= drv_pre - limit;
+        // Freeze integrator if increasing
+        if (_integral > int_last)
+          _integral = int_last;
+        //_integral -= drv_pre - limit;
         drv_pre = limit;
       }
       if (drv_pre < -limit) {
-        _integral -= drv_pre + limit;
+        // Freeze integrator if decreasing
+        if (_integral < int_last)
+          _integral = int_last;
+        // _integral -= drv_pre + limit;
         drv_pre = - limit;
       }
       _drive = drv_pre / _gain_div;
