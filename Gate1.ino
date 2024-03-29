@@ -201,8 +201,8 @@ class App {
   public:
     struct Btn {
       enum mask {
-        open = 1 << 7,
-        close = 1 << 6,
+        open = 1 << 6,
+        close = 1 << 5,
         stop = 1 << 4
       };
     };
@@ -223,7 +223,7 @@ class App {
       , _latch_lift("LatchLift", "mm", 19, 1250, 13, 1750, 44, 8)
       , _mctl(_batt_mv)
       , _vel_filter(2,8000)
-      , _vel_servo("vel", 20000, 500, 2000, 100)
+      , _vel_servo("vel", 25000, 500, 2000, 100)
       {
         start_control_task();
       }
@@ -571,8 +571,8 @@ class App {
     tunable::Item<uint16_t> _telem_low_rate = {"telem-lo-rate", 200};
     Target const * _target = 0;
     Target const * _docked_target = 0;
-    Target _open_target = {&_close_target, {"op-thres-mrad", 4935}, {"op-vdock-mmps", 600}, {"op-v-mmps", 500}, "open", Btn::open, Btn::close | Btn::stop, true };
-    Target _close_target = {&_open_target, {"cl-thres-mrad", 1760}, {"cl-vdock-mmps", 400}, {"cl-v-mmps", 500}, "close", Btn::close, Btn::open | Btn::stop, false };
+    Target _open_target = {&_close_target, {"op-thres-mrad", 4935}, {"op-vdock-mmps", 500}, {"op-v-mmps", 400}, "open", Btn::open, Btn::close | Btn::stop, true };
+    Target _close_target = {&_open_target, {"cl-thres-mrad", 1760}, {"cl-vdock-mmps", 400}, {"cl-v-mmps", 400}, "close", Btn::close, Btn::open | Btn::stop, false };
     Servo _vel_servo;
     int16_t _velocity_actual = 0;
     int16_t _torq_target = 0;
@@ -744,7 +744,10 @@ void setup() {
   cli_exec.add_command("taskinfo", taskinfo, "Dump status of specified task");
   cli_exec.add_command("mainstack", [](){ return uxTaskGetStackHighWaterMark(xTaskGetCurrentTaskHandle()); }, "High water mark of main stack");
   cli_exec.add_command("heap", [](){ return ESP.getFreeHeap(); }, "Free heap");
+  cli_exec.add_command("reboot", [](){ ESP.restart(); return "OK"; }, "Reboot");
   cli_exec.add_command("log", [](unsigned level){lg::LogStream::Instance().set_log_level(level); return level; }, "Set log level, 0-5");
+  cli_exec.add_command("scan", [](){ netw->scan_now(); return "Requesting Scan"; }, "Force SSID scan");
+
 
   netw = new Netw("gatectl", [](bool connected) {
     lg::D() << "Notify network " << (connected ? "connected" : "disconnected");
@@ -775,8 +778,7 @@ void setup() {
     std::ostringstream os;
     os << '{';
     telem_collect_fn(os);
-    os << ',';
-    netw->collect_telem(os);
+    netw->collect_telem(',', os);
     os << '}';
     mqtt->send_deferred("status", os.str());
   };

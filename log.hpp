@@ -4,6 +4,7 @@
 #include "Arduino.h"
 
 #include <sstream>
+#include <vector>
 
 namespace lg {
 

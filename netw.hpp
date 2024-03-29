@@ -17,9 +17,10 @@ class Netw {
     void set_delay(unsigned delayms) { _delayms = delayms; }
     bool connected() const { return _connected; }
     wl_status_t wifi_state() const { return WiFi.status(); }
-    void poll();
+    bool poll();
     void setup_net();
-    void collect_telem(std::ostream & os);
+    void scan_now() { _scan_now = true; }
+    bool collect_telem(char sep, std::ostream & os);
     std::string const & hostname() const { return _hostname; }
   private:
     void task();
@@ -30,6 +31,10 @@ class Netw {
     unsigned _delayms;
     wl_status_t _wifi_last = WL_NO_SHIELD;
     unsigned _scan_countdown = 1;
+    uint16_t _scan_count = 0;
+    uint16_t _state_change_count = 0;
+    bool _can_send = true;
+    bool _scan_now = false;
 };
 
 std::ostream & operator << (std::ostream & os,  wl_status_t state);

@@ -55,6 +55,7 @@ void Netw::setup_net()
   lg::I() <<"Enabled wifi, initial result: " << wifi_res;
   if (wifi_res == WL_CONNECT_FAILED) {
     lg::I() <<"Initial connect failed, performing scan";
+    ++_scan_count;
     find_ap();
   }
 }
@@ -66,28 +67,41 @@ void Netw::start()
   xTaskCreatePinnedToCore([](void *obj){ (*(Netw*)obj).task(); }, "net_task", 15000, this, 0, &_net_task, 0);
 }
 
-void Netw::poll()
+bool Netw::poll()
 {
+    bool fastpoll = true;
     // 100ms makes it bootloop a few times, 200ms is ok... wtf
     wl_status_t _wifi_state = WiFi.status();
 
     if (_wifi_state != _wifi_last) {
       lg::I() << "Wifi state change: " << _wifi_state << " (was "  << _wifi_last << ")" << " ssid: " << WiFi.SSID().c_str();
       _wifi_last = _wifi_state;
+      ++_state_change_count;
+      if (_wifi_state ==  WL_NO_SSID_AVAIL) {
+        _scan_countdown =  _scan_countdown > 5 ? 5 : _scan_countdown;
+      } else {
+        // Insurance if we get stuck in some weird state
+        _scan_countdown = 30;
+      }
     } else {
-          vTaskDelay(_delayms / portTICK_PERIOD_MS);
+      fastpoll=false;
     }
     if ((_wifi_state == WL_CONNECTED) != _connected) {
       _connected = _wifi_state == WL_CONNECTED;
       if (_notifyfn)
         _notifyfn(_connected);
     }
-    if (_wifi_state ==  WL_NO_SSID_AVAIL && --_scan_countdown == 0) {
-      _scan_countdown = 5;
-      lg::I() <<"No SSID, scanning";
+    if ((!_connected && --_scan_countdown == 0) || _scan_now) {
+      _scan_countdown = (_wifi_state ==  WL_NO_SSID_AVAIL) ? 5 : 30;
+      lg::I() << ( _scan_now ? "Starting forced SSID scan" : "No SSID, scanning");
+      _scan_now = false;
+      ++_scan_count;
       find_ap();
       lg::I() <<"Status now " << WiFi.status();
-    }  
+    }
+    // Don't send telemetry faster than our polling rate
+    _can_send = true;
+    return fastpoll;
 }
 
 void Netw::task()
@@ -95,13 +109,26 @@ void Netw::task()
   //uint32_t last_send = 0;
   lg::D() << "Comms Task" ;
   setup_net();
+  vTaskDelay(_delayms / portTICK_PERIOD_MS);
   for (;;) {
+    if (poll())
+      vTaskDelay(_delayms / portTICK_PERIOD_MS);
+    else
+      vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
 
-void Netw::collect_telem(std::ostream & os) {
-  os << "\"ssid\":\"" << WiFi.SSID().c_str()
-     << "\",\"rssi\":" << int(WiFi.RSSI());
+bool Netw::collect_telem(char sep, std::ostream & os) {
+  if (_can_send) {
+    if (sep)
+      os << sep;
+    os << "\"ssid\":\"" << WiFi.SSID().c_str()
+      << "\",\"rssi\":" << int(WiFi.RSSI())
+      << ",\"scans\":" << _scan_count;
+    _can_send = false;
+    return true;
+  }
+  return false;
 }
 
 std::ostream & operator << (std::ostream & os,  wl_status_t state) {
