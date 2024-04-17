@@ -7,6 +7,8 @@
 #include "tunable.hpp"
 #include "netw.hpp"
 #include "mqtt.hpp"
+#include "pwm_servo.hpp"
+#include "beacon.hpp"
 #include "Update.h"
 
 #include <array>
@@ -18,47 +20,6 @@
 
 #include "cal_data.hpp"
 
-class SrvPulseOut {
-  static constexpr auto _pwm_bits = 14;
-  static constexpr uint32_t us_to_pwm(uint32_t us, uint32_t f) { return (1 << (_pwm_bits-6)) * us * f / 15625; }
-  public:
-    SrvPulseOut(char const * name, char const * units, uint8_t pin, uint32_t cal1us, uint32_t cal1pos, uint32_t cal2us, uint32_t cal2pos, unsigned ledcidx, uint32_t freq = 200)
-      : _name(name)
-      , _units(units)
-      , _ledcidx(ledcidx)
-      , _num(us_to_pwm(cal2us - cal1us, freq))
-      , _div(cal2pos - cal1pos)
-      , _offs(us_to_pwm(cal1us, freq) - cal1pos * _num / _div)
-    {
-        ledcSetup(ledcidx, freq, _pwm_bits);
-        ledcAttachPin(pin, ledcidx);
-    }
-    void go(int32_t pos) {
-      int32_t pwm = pos * _num / _div + _offs;
-      ledcWrite(_ledcidx, pwm);
-      _last_pos = pos;
-    }
-    void go() { go(_last_pos); }
-    void stop() {
-      ledcWrite(_ledcidx, 0);
-    }
-    int32_t get_last_pos() const { return _last_pos; }
-    uint32_t raw() const { return ledcRead(_ledcidx); }
-    char const * name() const { return _name; }
-    char const * units() const { return _units; }
-  private:
-    char const * const _name;
-    char const * const _units;
-    uint8_t const _ledcidx;
-    int32_t const _num;
-    int32_t const _div;
-    int32_t const _offs;
-    int32_t _last_pos = 0;
-};
-
-std::ostream & operator<<(std::ostream & os, SrvPulseOut const & spo) {
-  return os << spo.name() << '=' << spo.get_last_pos() << spo.units() << '(' << spo.raw() << ')';
-}
 
 template<typename A>
 struct StateMachine {
@@ -194,6 +155,7 @@ class App {
       uint8_t const btn_go_msk;
       uint8_t const btn_stop_msk;
       bool const posdir;
+      Beacon::colour finish_col;
     };
     static constexpr int intervalms = 10;
     static constexpr int recoverytimems = 5000;
@@ -224,6 +186,7 @@ class App {
       , _mctl(_batt_mv)
       , _vel_filter(2,8000)
       , _vel_servo("vel", 25000, 500, 2000, 100)
+      , _beacon([this](bool on) {this->_i2cgpio1.set(1, on);})
       {
         start_control_task();
       }
@@ -252,6 +215,9 @@ class App {
         _telem_countdown = min_telem_count;
     };
     void set_telltale(Telltale::mode mode) { _telltale_mode = mode; }
+    void set_beacon_mode(Beacon::pattern p, Beacon::colour c) {
+      _beacon.set_mode(p, c);
+    }
     void collect_and_serialize_stats(std::ostream & os) {
           _mctl.reset_stats();
           auto s = _mctl.get_last_stats();
@@ -303,6 +269,8 @@ class App {
       _retry_count = 0;
       liftlatch();
       set_telltale(Telltale::telem_short);
+      _beacon.set_mode(Beacon::solid, Beacon::amber);
+
     }
     void preparemove() {
       _vel_servo.reset();
@@ -315,6 +283,7 @@ class App {
       _vel_servo.set_target(_target->move_velocity * (_target->posdir ? 1 : -1));
       set_timeout_s(_move_timeout);
       _telem_countdown = 0;
+      _beacon.set_mode( _target->posdir ? Beacon::rotatingcw : Beacon::rotatingccw, Beacon::amber);
     }
     void gotodockspeed() {
       int vtarg = _target->docking_velocity * (_target->posdir ? 1 : -1);
@@ -346,6 +315,7 @@ class App {
       _mctl.stop();
       _mot_run = false;
       _vel_servo.reset();
+      _beacon.set_mode(Beacon::fadeoff, _target->finish_col);
       _docked_target = _target;
       if (_target)
         _target = _target->opposite;
@@ -368,12 +338,14 @@ class App {
       stop_timeout();
       set_telem_rate(_telem_low_rate);
       set_telltale(Telltale::telem_short);
+      _beacon.set_mode(Beacon::strobe, Beacon::yellow);
     }
     void errorfree() {
       befree();
       lg::E() << "Transition into error state: " << _error;
       set_timeout_ms(recoverytimems);
       set_telltale(Telltale::error_blink);
+      _beacon.set_mode(Beacon::strobe, Beacon::red);
     }
     void errorpersist() {
       set_timeout_ms(recoverytimems);
@@ -383,6 +355,7 @@ class App {
       _target = 0;
       _telem_countdown = 1;
       set_telltale(Telltale::telem_short);
+      _beacon.set_mode(Beacon::strobe, Beacon::yellow);
     }
 
     void control_task()
@@ -433,6 +406,8 @@ class App {
 
         if (error)
           _appsm.handle_event(ev.hardwareerror);
+
+        //_beacon.loop();
 
         if (_btn_sim) {
           lg::I() << "Simulated Button Push: 0x" << std::hex << unsigned(_btn_sim);
@@ -571,8 +546,8 @@ class App {
     tunable::Item<uint16_t> _telem_low_rate = {"telem-lo-rate", 200};
     Target const * _target = 0;
     Target const * _docked_target = 0;
-    Target _open_target = {&_close_target, {"op-thres-mrad", 4935}, {"op-vdock-mmps", 500}, {"op-v-mmps", 400}, "open", Btn::open, Btn::close | Btn::stop, true };
-    Target _close_target = {&_open_target, {"cl-thres-mrad", 1760}, {"cl-vdock-mmps", 400}, {"cl-v-mmps", 400}, "close", Btn::close, Btn::open | Btn::stop, false };
+    Target _open_target = {&_close_target, {"op-thres-mrad", 4935}, {"op-vdock-mmps", 500}, {"op-v-mmps", 400}, "open", Btn::open, Btn::close | Btn::stop, true, Beacon::green };
+    Target _close_target = {&_open_target, {"cl-thres-mrad", 1762}, {"cl-vdock-mmps", 400}, {"cl-v-mmps", 400}, "close", Btn::close, Btn::open | Btn::stop, false, Beacon::red };
     Servo _vel_servo;
     int16_t _velocity_actual = 0;
     int16_t _torq_target = 0;
@@ -585,6 +560,7 @@ class App {
     errorcode _error;
     uint32_t _count = 0;
     Telltale::mode _telltale_mode = Telltale::telem_short;
+    Beacon _beacon;
 
 };
 
@@ -717,7 +693,8 @@ void add_control_app_cmds(App & app)
   cli_exec.add_command("vel", [&app](int vel){app.set_target_vel(vel); return "Ok";}, "Set gate target velocity and enable vel servo");
   cli_exec.add_command("veloff", [&app](){app.clear_target_vel(); return "Ok";}, "Reset target velocity and disable vel servo");
   cli_exec.add_command("telemrate", [&app](uint16_t rate){app.set_telem_rate(rate); return "Ok";}, "Set telemetry rate in control intervals");
-  cli_exec.add_command("telltale", [&app](unsigned mode){app.set_telltale(App::Telltale::mode(mode)); return "Ok";}, "Set set telltale mode");
+  cli_exec.add_command("telltale", [&app](unsigned mode){app.set_telltale(App::Telltale::mode(mode)); return "Ok";}, "Set telltale mode");
+  cli_exec.add_command("beacon", [&app](unsigned pattern, unsigned colour){app.set_beacon_mode(Beacon::pattern(pattern), Beacon::colour(colour)); return "Ok";}, "Set beacon mode and colour");
   cli_exec.add_command("btn-open", [&app](){app.sim_btn_push(App::Btn::open); return "Ok";}, "Simulate open button push");
   cli_exec.add_command("btn-close", [&app](){app.sim_btn_push(App::Btn::close); return "Ok";}, "Simulate close button push");
   cli_exec.add_command("btn-stop", [&app](){app.sim_btn_push(App::Btn::stop); return "Ok";}, "Simulate stop button push");

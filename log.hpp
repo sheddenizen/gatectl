@@ -76,13 +76,13 @@ class Entry {
   public:
     Entry() {
       char p[] = { prefx... , ':', ' ', 0 };
-      if (! _ss.bad())
-        _ss << p;
+      _ss << p;
     }
     ~Entry()
     {
       _ss << std::endl;
-      LogStream::Instance().add(level, _ss);
+      if (! _ss.bad())
+        LogStream::Instance().add(level, _ss);
     }
     std::ostream & operator()() { return _ss; }
     std::ostream & if_true(bool cond) {
@@ -92,7 +92,15 @@ class Entry {
         _ss.clear(std::ios_base::badbit);
       return _ss;
     }
-      
+    std::ostream & if_non_zero(int ret) {
+      if (ret == 0)
+        _ss.setstate(std::ios_base::badbit);
+      else {
+        _ss.clear(std::ios_base::badbit);
+        _ss << "Return Value " << ret << ": ";
+      }
+      return _ss;
+    }      
     template <typename T>
     std::ostream & operator << (T const & v) { return _ss << v; }
 
